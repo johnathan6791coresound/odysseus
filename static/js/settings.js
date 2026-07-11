@@ -22,7 +22,7 @@ function safeRasterDataUrl(raw) {
 }
 
 /* ── Tab switching ── */
-const ADMIN_TABS = new Set(['services', 'integrations', 'tools', 'users', 'system']);
+const ADMIN_TABS = new Set(['services', 'integrations', 'tools', 'users', 'system', 'usage']);
 
 function initTabs() {
   modalEl.querySelectorAll('[data-settings-tab]').forEach(btn => {
@@ -579,7 +579,20 @@ async function initUtilityModel() {
   var epSel = el('set-utilityEpSelect');
   var modelSel = el('set-utilityModelSelect');
   var msg = el('set-utilityChatMsg');
+  var eff = el('set-utilityEffective');
   var _endpoints = [];
+
+  // Show what utility work actually resolves to right now (cost auto-routing /
+  // cascade), which the model dropdown can't reveal when it's "Same as chat".
+  async function updateEffective() {
+    if (!eff) return;
+    try {
+      var r = await fetch('/api/auth/effective-utility-model', { credentials: 'same-origin' });
+      if (!r.ok) { eff.textContent = ''; return; }
+      var d = await r.json();
+      eff.textContent = d.descriptor ? ('Effective: ' + d.descriptor) : '';
+    } catch (e) { eff.textContent = ''; }
+  }
   var fallbackWidget = null;
   if (epSel && epSel.options[0]) epSel.options[0].textContent = 'Same as chat';
   if (modelSel && modelSel.options[0]) modelSel.options[0].textContent = 'Same as chat';
@@ -611,6 +624,8 @@ async function initUtilityModel() {
     });
   } catch (e) { console.warn('Failed to load utility model settings', e); }
 
+  updateEffective();
+
   // Persist whatever's currently selected. Empty endpoint or model → backend
   // transparently falls back to the chat model (mirrors the teacher panel:
   // no toggle, "—" means "unset, use chat").
@@ -625,6 +640,7 @@ async function initUtilityModel() {
       });
       msg.textContent = 'Saved'; msg.style.color = 'var(--fg)';
       setTimeout(function() { msg.textContent = ''; }, 1500);
+      updateEffective();
     } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
   }
 
@@ -878,6 +894,51 @@ async function initVisionSettings() {
     _visionEndpoints = endpoints;
     if (visionFallbackWidget && visionFallbackWidget.refresh) visionFallbackWidget.refresh();
   });
+}
+
+/* ── Cost Auto-Routing ── */
+async function initCostRoutingSettings() {
+  const master = el('set-costAutoRoutingToggle');
+  const autoCheap = el('set-utilityAutoCheapToggle');
+  const preferLocal = el('set-utilityPreferLocalToggle');
+  const subs = el('set-costRoutingSubs');
+  const msg = el('set-costRoutingMsg');
+  if (!master) return;  // card not present (non-admin view)
+
+  try {
+    const res = await fetch('/api/auth/settings', { credentials: 'same-origin' });
+    const s = await res.json();
+    master.checked = s.cost_auto_routing_enabled !== false;
+    if (autoCheap) autoCheap.checked = s.utility_auto_cheap_enabled !== false;
+    if (preferLocal) preferLocal.checked = s.utility_prefer_local_enabled !== false;
+  } catch (e) { console.warn('Failed to load cost-routing settings', e); }
+
+  // Sub-toggles only matter when the master is on; grey them out otherwise.
+  // Prefer-local only matters when auto-cheap is also on.
+  function syncDisabled() {
+    const masterOff = !master.checked;
+    if (subs) { subs.style.opacity = masterOff ? '0.45' : ''; subs.style.pointerEvents = masterOff ? 'none' : ''; }
+    if (preferLocal) {
+      const plOff = masterOff || (autoCheap && !autoCheap.checked);
+      const row = preferLocal.closest('.admin-toggle-row');
+      if (row) row.style.opacity = plOff ? '0.45' : '';
+    }
+  }
+  syncDisabled();
+
+  async function save() {
+    try {
+      await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cost_auto_routing_enabled: master.checked,
+          utility_auto_cheap_enabled: autoCheap ? autoCheap.checked : true,
+          utility_prefer_local_enabled: preferLocal ? preferLocal.checked : true,
+        }) });
+      if (msg) { msg.textContent = 'Saved'; msg.style.color = 'var(--fg)'; setTimeout(() => { msg.textContent = ''; }, 2000); }
+    } catch (e) { if (msg) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; } }
+  }
+
+  [master, autoCheap, preferLocal].forEach(t => t && t.addEventListener('change', () => { syncDisabled(); save(); }));
 }
 
 /* ── Face Recognition ── */
@@ -2328,6 +2389,7 @@ function initAll() {
   initUtilityModel();
   initImageSettings();
   initVisionSettings();
+  initCostRoutingSettings();
   initTtsSettings();
   initSttSettings();
   initSearchSettings();
@@ -3494,9 +3556,12 @@ const INTG_TYPES = {
   carddav: { label: 'CardDAV', icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>' },
   email:   { label: 'Email',   icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg>' },
   mcp:     { label: 'MCP',     icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>' },
+  cli:     { label: 'CLI',     icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>' },
+  ssh:     { label: 'SSH',     icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8l4 4-4 4"/><line x1="12" y1="16" x2="18" y2="16"/></svg>' },
   codex:   { label: 'Codex',   icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M22.282 9.821a5.985 5.985 0 0 0-.516-4.91 6.046 6.046 0 0 0-6.51-2.9A6.065 6.065 0 0 0 10.696.453a6.023 6.023 0 0 0-5.75 4.172 6.061 6.061 0 0 0-3.946 2.945 6.024 6.024 0 0 0 .742 7.099 5.98 5.98 0 0 0 .516 4.911 6.046 6.046 0 0 0 6.51 2.9A5.996 5.996 0 0 0 13.26 23.547a6.023 6.023 0 0 0 5.75-4.172 6.061 6.061 0 0 0 3.946-2.945 6.024 6.024 0 0 0-.674-6.609zM13.26 21.047a4.508 4.508 0 0 1-2.886-1.041l.143-.082 4.793-2.769a.777.777 0 0 0 .391-.676V10.34l2.026 1.17a.072.072 0 0 1 .039.061v5.596a4.532 4.532 0 0 1-4.506 4.48zM3.968 17.64a4.473 4.473 0 0 1-.537-3.018l.143.086 4.793 2.769a.79.79 0 0 0 .782 0l5.852-3.379v2.34a.072.072 0 0 1-.029.062l-4.845 2.796a4.532 4.532 0 0 1-6.159-1.656zM2.804 7.922a4.49 4.49 0 0 1 2.348-1.973V11.6a.778.778 0 0 0 .391.676l5.852 3.378-2.026 1.17a.072.072 0 0 1-.068 0L4.456 14.03a4.532 4.532 0 0 1-1.652-6.108zm16.423 3.823L13.375 8.367l2.026-1.17a.072.072 0 0 1 .068 0l4.845 2.796a4.525 4.525 0 0 1-.7 8.08V12.42a.778.778 0 0 0-.387-.676zm2.015-3.025l-.143-.086-4.793-2.769a.79.79 0 0 0-.782 0L9.672 9.243V6.903a.072.072 0 0 1 .029-.062l4.845-2.796a4.525 4.525 0 0 1 6.696 4.675zM8.598 12.66L6.57 11.49a.072.072 0 0 1-.039-.061V5.833a4.525 4.525 0 0 1 7.413-3.48l-.143.082-4.793 2.769a.777.777 0 0 0-.391.676l-.019 6.78zm1.1-2.379l2.607-1.505 2.607 1.505v3.01l-2.607 1.505-2.607-1.505z"/></svg>' },
   claude:  { label: 'Claude',  icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M17.3041 3.541h-3.6718l6.696 16.918H24Zm-10.6082 0L0 20.459h3.7442l1.3693-3.5527h7.0052l1.3693 3.5528h3.7442L10.5363 3.5409Zm-.3712 10.2232 2.2914-5.9456 2.2914 5.9456Z"/></svg>' },
   vault:   { label: 'Vault',   icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>' },
+  telegram: { label: 'Telegram', icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M21.94 4.6 18.6 20.36c-.25 1.12-.9 1.39-1.82.87l-5.03-3.7-2.43 2.34c-.27.27-.5.5-1.02.5l.36-5.15L18.3 6.5c.42-.37-.09-.58-.65-.2L7.02 13.6l-4.96-1.55c-1.08-.34-1.1-1.08.23-1.6L20.6 3.4c.9-.33 1.68.2 1.34 1.2z"/></svg>' },
 };
 
 // Config shared by the Codex Agent and Claude Agent forms. Both use the same
@@ -3589,7 +3654,7 @@ async function initUnifiedIntegrations() {
   }
 
   async function fetchAll() {
-    const [apiRes, calRes, cardRes, contactsRes, emailAccountsRes, mcpRes, vaultRes, tokenRes, calendarsRes] = await Promise.all([
+    const [apiRes, calRes, cardRes, contactsRes, emailAccountsRes, mcpRes, vaultRes, tokenRes, calendarsRes, cliRes, sshRes, telegramStatusRes, telegramBotsRes] = await Promise.all([
       fetch('/api/auth/integrations', { credentials: 'same-origin' }).then(r => r.ok ? r.json() : { integrations: [] }).catch(() => ({ integrations: [] })),
       fetch('/api/calendar/config/accounts', { credentials: 'same-origin' }).then(r => r.ok ? r.json() : { accounts: [] }).catch(() => ({ accounts: [] })),
       fetch('/api/contacts/config', { credentials: 'same-origin' }).then(r => r.ok ? r.json() : {}).catch(() => ({})),
@@ -3599,6 +3664,10 @@ async function initUnifiedIntegrations() {
       fetch('/api/vault/config', { credentials: 'same-origin' }).then(r => r.ok ? r.json() : {}).catch(() => ({})),
       fetch('/api/tokens', { credentials: 'same-origin' }).then(r => r.ok ? r.json() : []).catch(() => []),
       fetch('/api/calendar/calendars', { credentials: 'same-origin' }).then(r => r.ok ? r.json() : { calendars: [] }).catch(() => ({ calendars: [] })),
+      fetch('/api/cli/integrations', { credentials: 'same-origin' }).then(r => r.ok ? r.json() : []).catch(() => []),
+      fetch('/api/ssh/connections', { credentials: 'same-origin' }).then(r => r.ok ? r.json() : []).catch(() => []),
+      fetch('/api/telegram/status', { credentials: 'same-origin' }).then(r => r.ok ? r.json() : { linked_chats: [] }).catch(() => ({ linked_chats: [] })),
+      fetch('/api/telegram/bots', { credentials: 'same-origin' }).then(r => r.ok ? r.json() : []).catch(() => []),
     ]);
     const items = [];
     // API integrations
@@ -3640,7 +3709,7 @@ async function initUnifiedIntegrations() {
     // MCP servers
     const mcpList = Array.isArray(mcpRes) ? mcpRes : (mcpRes.servers || []);
     for (const srv of mcpList) {
-      const statusText = srv.needs_oauth ? 'needs auth' : srv.status === 'connected' ? `${srv.enabled_tool_count}/${srv.tool_count} tools` : srv.status === 'error' ? 'error' : 'disconnected';
+      const statusText = (srv.needs_oauth || srv.status === 'needs_auth') ? 'needs auth' : srv.status === 'connected' ? `${srv.enabled_tool_count}/${srv.tool_count} tools` : srv.status === 'error' ? 'error' : 'disconnected';
       items.push({ type: 'mcp', id: srv.id || srv.name, name: srv.name || 'MCP Server', detail: statusText, enabled: srv.is_enabled !== false, data: srv });
     }
     for (const tok of (Array.isArray(tokenRes) ? tokenRes : [])) {
@@ -3656,6 +3725,39 @@ async function initUnifiedIntegrations() {
       if (!agentType) continue;
       const detail = `${tok.token_prefix || 'token'}... - ${scopes.join(', ') || 'chat'}`;
       items.push({ type: agentType, id: tok.id, name: tok.name || (agentType === 'claude' ? 'Claude Agent' : 'Codex Agent'), detail, enabled: true, data: tok });
+    }
+    // CLI integrations (per-host SSH keys for git, or AWS CLI credentials)
+    for (const cli of (Array.isArray(cliRes) ? cliRes : [])) {
+      const label = cli.kind === 'aws_cli' ? `AWS (${cli.aws_region || 'us-east-1'})` : cli.host;
+      const detail = cli.last_test_status === 'ok' ? `${label} — verified` : cli.last_test_status === 'error' ? `${label} — auth failed` : `${label} — not tested`;
+      items.push({ type: 'cli', id: cli.id, name: cli.name || label, detail, enabled: cli.is_enabled !== false, data: cli });
+    }
+    // SSH connections (generic remote-host access)
+    for (const conn of (Array.isArray(sshRes) ? sshRes : [])) {
+      const detail = conn.last_test_status === 'ok' ? `${conn.host} — verified` : conn.last_test_status === 'error' ? `${conn.host} — auth failed` : `${conn.host} — not tested`;
+      items.push({ type: 'ssh', id: conn.id, name: conn.name || conn.host, detail, enabled: conn.is_enabled !== false, data: conn });
+    }
+    // Telegram — one card per registered bot (admin only, since adding/
+    // editing a bot is a shared credential), one per chat the current user
+    // has linked (any user, since each user's own links are theirs).
+    if (window._isAdmin) {
+      for (const bot of (Array.isArray(telegramBotsRes) ? telegramBotsRes : [])) {
+        items.push({
+          type: 'telegram', id: bot.id, name: bot.name || 'Telegram Bot',
+          detail: !bot.configured ? 'Not configured'
+            : bot.enabled ? (bot.is_notifier ? 'Enabled — notifier' : 'Enabled') : 'Configured, disabled',
+          enabled: !!(bot.configured && bot.enabled),
+          data: { kind: 'bot', ...bot },
+        });
+      }
+    }
+    for (const link of (telegramStatusRes.linked_chats || [])) {
+      items.push({
+        type: 'telegram', id: link.id, name: `Linked: ${link.bot_name || 'Telegram Bot'}`,
+        detail: link.active_session_id ? `session ${String(link.active_session_id).slice(0, 8)}` : 'no active session yet',
+        enabled: true,
+        data: { kind: 'link', ...link },
+      });
     }
     // Vaultwarden removed as an integration option.
     return items;
@@ -3676,7 +3778,7 @@ async function initUnifiedIntegrations() {
         <div style="font-size:11px;opacity:0.5;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${item.detail || ''}</div>
       </div>
       ${statusDot}
-      <button class="admin-btn-sm intg-del-btn" data-intg-id="${item.id}" data-intg-type="${item.type}" data-intg-name="${(item.name || '').replace(/"/g, '&quot;')}" title="Remove" style="background:none;border:none;padding:4px;cursor:pointer;color:var(--red);opacity:0.55;display:inline-flex;align-items:center;justify-content:center;">
+      <button class="admin-btn-sm intg-del-btn" data-intg-id="${item.id}" data-intg-type="${item.type}" data-intg-kind="${item.data && item.data.kind || ''}" data-intg-name="${(item.name || '').replace(/"/g, '&quot;')}" title="Remove" style="background:none;border:none;padding:4px;cursor:pointer;color:var(--red);opacity:0.55;display:inline-flex;align-items:center;justify-content:center;">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
       </button>
     </div>`;
@@ -3731,8 +3833,14 @@ async function initUnifiedIntegrations() {
           }
           else if (type === 'email') await fetch(`/api/email/accounts/${id}`, { method: 'DELETE', credentials: 'same-origin' });
           else if (type === 'mcp') await fetch(`/api/mcp/servers/${id}`, { method: 'DELETE', credentials: 'same-origin' });
+          else if (type === 'cli') await fetch(`/api/cli/integrations/${id}`, { method: 'DELETE', credentials: 'same-origin' });
+          else if (type === 'ssh') await fetch(`/api/ssh/connections/${id}`, { method: 'DELETE', credentials: 'same-origin' });
           else if (type === 'codex' || type === 'claude') await fetch(`/api/tokens/${id}`, { method: 'DELETE', credentials: 'same-origin' });
           else if (type === 'vault') await fetch('/api/vault/logout', { method: 'POST', credentials: 'same-origin' });
+          else if (type === 'telegram') {
+            if (btn.dataset.intgKind === 'bot') await fetch(`/api/telegram/bots/${id}`, { method: 'DELETE', credentials: 'same-origin' });
+            else await fetch(`/api/telegram/link/${id}`, { method: 'DELETE', credentials: 'same-origin' });
+          }
         } catch (_) {}
         formEl.style.display = 'none';
         await renderList();
@@ -3748,9 +3856,12 @@ async function initUnifiedIntegrations() {
     else if (type === 'contacts' || type === 'carddav') showCardDavForm();
     else if (type === 'email') showEmailForm(editId);
     else if (type === 'mcp') showMcpForm(editId);
+    else if (type === 'cli') showCliForm(editId);
+    else if (type === 'ssh') showSshForm(editId);
     else if (type === 'codex') showAgentForm('codex', editId);
     else if (type === 'claude') showAgentForm('claude', editId);
     else if (type === 'vault') showVaultForm();
+    else if (type === 'telegram') showTelegramForm(editId);
   }
 
   // ── API form ──
@@ -4868,6 +4979,141 @@ async function initUnifiedIntegrations() {
   }
 
   // ── Vaultwarden form ──
+  async function showTelegramForm(editId) {
+    const isAdmin = !!window._isAdmin;
+    let bots = [];
+    try {
+      const r = await fetch('/api/telegram/bots', { credentials: 'same-origin' });
+      if (r.ok) bots = await r.json();
+    } catch (_) {}
+    // editId is a bot's own id when the click came from a bot card (or
+    // 'new' from the Add Integration menu); a link card's id never matches
+    // a bot id, so editingBot stays null and we fall through to link-only view.
+    const editingBot = bots.find(b => b.id === editId) || null;
+    const showBotEditor = isAdmin && (editId === 'new' || !!editingBot);
+
+    const botEditorHtml = showBotEditor ? `
+      <div style="border:1px solid var(--border);border-radius:6px;padding:9px 10px;margin-bottom:10px;">
+        <div style="font-size:11px;font-weight:600;opacity:0.7;margin-bottom:6px;">${editingBot ? 'Edit bot' : 'Add a bot'} (admin)</div>
+        <div class="settings-row"><label class="settings-label">Name</label><input id="uf-tg-name" class="settings-input" placeholder="e.g. Personal, Work Project"></div>
+        <div class="settings-row"><label class="settings-label">Bot token</label><input id="uf-tg-token" class="settings-input" type="password" placeholder="From @BotFather, e.g. 123456:AA..."></div>
+        <div class="settings-row" style="align-items:center;">
+          <label class="settings-label">Enabled</label>
+          <label class="admin-switch"><input type="checkbox" id="uf-tg-enabled" checked><span class="admin-slider"></span></label>
+        </div>
+        <div class="settings-row" style="align-items:center;">
+          <label class="settings-label">Notifier</label>
+          <label class="admin-switch"><input type="checkbox" id="uf-tg-notifier"><span class="admin-slider"></span></label>
+          <span style="font-size:10px;opacity:0.55;margin-left:6px;">Only one bot can send task notifications</span>
+        </div>
+        <div class="settings-row" style="margin-top:6px;justify-content:flex-end;gap:6px;">
+          <span id="uf-tg-admin-msg" style="font-size:11px;flex:1;"></span>
+          <button class="admin-btn-sm" id="uf-tg-save">Save</button>
+        </div>
+      </div>` : (isAdmin ? '' : `
+      <div style="font-size:11px;opacity:0.6;margin-bottom:10px;">Ask an admin to add a bot before linking your account.</div>`);
+
+    const botOptionsHtml = bots.map(b => `<option value="${esc(b.id)}">${esc(b.name || 'Telegram Bot')}${b.configured ? '' : ' (not configured)'}</option>`).join('');
+
+    formEl.innerHTML = `
+      <div class="admin-card" style="margin-top:8px">
+        <h2 style="font-size:13px">Telegram</h2>
+        <div class="admin-toggle-sub" style="margin-bottom:8px">Message a bot to run and switch Odysseus sessions from Telegram. Multiple bots can be linked to different sessions; one bot can be designated to receive task notifications.</div>
+        <div class="settings-col">
+          ${botEditorHtml}
+          <div style="border:1px solid var(--border);border-radius:6px;padding:9px 10px;">
+            <div style="font-size:11px;font-weight:600;opacity:0.7;margin-bottom:6px;">Link your account to a bot</div>
+            <div id="uf-tg-link-status" style="font-size:11px;opacity:0.7;margin-bottom:8px;">Loading...</div>
+            <div class="settings-row" style="align-items:center;">
+              <label class="settings-label">Bot</label>
+              <select id="uf-tg-link-bot" class="settings-select">${botOptionsHtml || '<option value="">No bots configured</option>'}</select>
+            </div>
+            <div class="settings-row" style="justify-content:flex-end;gap:6px;">
+              <span id="uf-tg-link-msg" style="font-size:11px;flex:1;"></span>
+              <button class="admin-btn-sm" id="uf-tg-link-btn" ${bots.length ? '' : 'disabled'}>Generate link code</button>
+            </div>
+            <div id="uf-tg-code-box" style="display:none;margin-top:8px;">
+              <div style="font-size:11px;opacity:0.62;margin-bottom:4px;">In Telegram, message that bot:</div>
+              <code style="display:block;word-break:break-all;font-size:12px;padding:6px 8px;background:rgba(0,0,0,0.08);border-radius:4px;" id="uf-tg-code"></code>
+            </div>
+          </div>
+          <div class="settings-row" style="margin-top:10px;justify-content:flex-end;">
+            <button class="admin-btn-add" id="uf-tg-cancel" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">Close</button>
+          </div>
+        </div>
+      </div>`;
+
+    el('uf-tg-cancel').addEventListener('click', () => { formEl.style.display = 'none'; });
+
+    if (showBotEditor) {
+      if (editingBot) {
+        el('uf-tg-name').value = editingBot.name || '';
+        el('uf-tg-enabled').checked = !!editingBot.enabled;
+        el('uf-tg-notifier').checked = !!editingBot.is_notifier;
+        el('uf-tg-token').placeholder = editingBot.configured ? 'Token saved — leave blank to keep it' : 'From @BotFather, e.g. 123456:AA...';
+      }
+
+      el('uf-tg-save').addEventListener('click', async () => {
+        const msg = el('uf-tg-admin-msg');
+        msg.textContent = 'Saving...'; msg.style.color = '';
+        const name = el('uf-tg-name').value.trim();
+        const token = el('uf-tg-token').value.trim();
+        const body = {
+          name: name || undefined,
+          enabled: el('uf-tg-enabled').checked,
+          is_notifier: el('uf-tg-notifier').checked,
+        };
+        if (token) body.bot_token = token;
+        if (!editingBot && !token) { msg.textContent = 'Bot token is required'; msg.style.color = 'var(--red)'; return; }
+        try {
+          const url = editingBot ? `/api/telegram/bots/${editingBot.id}` : '/api/telegram/bots';
+          const r = await fetch(url, {
+            method: editingBot ? 'PATCH' : 'POST', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          const d = await r.json().catch(() => ({}));
+          if (!r.ok) throw new Error(d.detail || 'Failed');
+          msg.textContent = 'Saved'; msg.style.color = 'var(--green,#50fa7b)';
+          await renderList();
+        } catch (e) { msg.textContent = e.message || 'Failed'; msg.style.color = 'var(--red)'; }
+      });
+    }
+
+    async function refreshLinkStatus() {
+      const statusEl = el('uf-tg-link-status');
+      try {
+        const r = await fetch('/api/telegram/status', { credentials: 'same-origin' });
+        const d = await r.json();
+        const chats = d.linked_chats || [];
+        statusEl.textContent = chats.length
+          ? chats.map(c => `${c.bot_name || 'Telegram Bot'}${c.active_session_id ? ` (session ${String(c.active_session_id).slice(0, 8)})` : ''}`).join(', ')
+          : 'No Telegram chat linked yet.';
+      } catch (_) { statusEl.textContent = 'Failed to load link status'; }
+    }
+    await refreshLinkStatus();
+
+    const linkBtn = el('uf-tg-link-btn');
+    if (linkBtn) linkBtn.addEventListener('click', async () => {
+      const msg = el('uf-tg-link-msg');
+      const botId = el('uf-tg-link-bot').value;
+      if (!botId) { msg.textContent = 'No bot selected'; msg.style.color = 'var(--red)'; return; }
+      msg.textContent = 'Generating...'; msg.style.color = '';
+      try {
+        const r = await fetch('/api/telegram/link', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bot_id: botId }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.detail || 'Failed');
+        msg.textContent = '';
+        el('uf-tg-code-box').style.display = '';
+        el('uf-tg-code').textContent = `/start ${d.link_code}`;
+      } catch (e) { msg.textContent = e.message || 'Failed'; msg.style.color = 'var(--red)'; }
+    });
+  }
+
   async function showVaultForm() {
     formEl.innerHTML = `
       <div class="admin-card" style="margin-top:8px">
@@ -5067,9 +5313,15 @@ async function initUnifiedIntegrations() {
         const srv = servers.find(s => (s.id || s.name) === editId);
         if (!srv) { formEl.innerHTML = '<div class="admin-card" style="margin-top:8px">Server not found</div>'; return; }
         const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');
-        const statusColor = srv.needs_oauth ? '#e5a33a' : srv.status === 'connected' ? 'var(--green,#50fa7b)' : srv.status === 'error' ? 'var(--red)' : 'var(--fg)';
+        // `needs_oauth` only covers the legacy manual (Google keys-file) OAuth
+        // config path. Servers using the newer RFC 9728 / Dynamic Client
+        // Registration auto-discovery flow (any `http` transport server with
+        // no `oauth_config` row, e.g. Atlassian) instead report
+        // status === 'needs_auth' + a live `auth_url` — treat both as "needs auth".
+        const needsAnyAuth = srv.needs_oauth || srv.status === 'needs_auth';
+        const statusColor = needsAnyAuth ? '#e5a33a' : srv.status === 'connected' ? 'var(--green,#50fa7b)' : srv.status === 'error' ? 'var(--red)' : 'var(--fg)';
         const toolInfo = srv.status === 'connected' ? `${srv.enabled_tool_count}/${srv.tool_count} tools` : '';
-        const statusText = srv.needs_oauth ? 'Needs authorization' : srv.status === 'connected' ? `Connected (${toolInfo})` : srv.status === 'error' ? `Error: ${esc(srv.error || 'unknown')}` : 'Disconnected';
+        const statusText = needsAnyAuth ? 'Needs authorization' : srv.status === 'connected' ? `Connected (${toolInfo})` : srv.status === 'error' ? `Error: ${esc(srv.error || 'unknown')}` : 'Disconnected';
         formEl.innerHTML = `
           <div class="admin-card" style="margin-top:8px">
             <h2 style="font-size:13px">${esc(srv.name)}</h2>
@@ -5079,7 +5331,7 @@ async function initUnifiedIntegrations() {
             </div>
             <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:8px;justify-content:flex-end;">
               <span id="uf-mcp-msg" style="font-size:11px;flex:1;margin-right:8px"></span>
-              ${srv.needs_oauth ? `<a href="/api/mcp/oauth/authorize/${srv.id}" target="_blank" class="admin-btn-add" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));text-decoration:none;font-weight:600;">Authorize</a>` : ''}
+              ${srv.needs_oauth ? `<a href="/api/mcp/oauth/authorize/${srv.id}" target="_blank" class="admin-btn-add" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));text-decoration:none;font-weight:600;">Authorize</a>` : srv.status === 'needs_auth' ? `<button class="admin-btn-add" id="uf-mcp-authorize" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));font-weight:600;">Authorize</button>` : ''}
               <button class="admin-btn-add" id="uf-mcp-reconnect" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">Reconnect</button>
               <button class="admin-btn-add" id="uf-mcp-toggle" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">${srv.is_enabled ? 'Disable' : 'Enable'}</button>
               <button class="admin-btn-add" id="uf-mcp-cancel" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">Close</button>
@@ -5096,6 +5348,11 @@ async function initUnifiedIntegrations() {
             await renderList();
             showMcpForm(editId); // refresh this view
           } catch (e) { msg.textContent = 'Failed'; }
+        });
+        // Authorize (RFC 9728 / Dynamic Client Registration auto-discovery flow)
+        const authBtn = el('uf-mcp-authorize');
+        if (authBtn) authBtn.addEventListener('click', () => {
+          _handleMcpAuth(srv.id, srv.auth_url);
         });
         // Toggle enable/disable
         el('uf-mcp-toggle').addEventListener('click', async () => {
@@ -5196,6 +5453,288 @@ async function initUnifiedIntegrations() {
         finally { _setBtnLoading(saveBtn, false, _origLabel); if (cancelBtn) cancelBtn.disabled = false; }
       });
     }
+  }
+
+  // ── CLI integration form: git_ssh or aws_cli, used by the `bash` tool ──
+  async function showCliForm(editId) {
+    const esc = s => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    let srv = null;
+    if (editId && editId !== 'new') {
+      formEl.innerHTML = '<div class="admin-card" style="margin-top:8px"><span style="opacity:0.5;font-size:11px">Loading...</span></div>';
+      try {
+        const res = await fetch('/api/cli/integrations', { credentials: 'same-origin' });
+        const list = await res.json();
+        srv = list.find(s => s.id === editId);
+      } catch (_) {}
+      if (!srv) { formEl.innerHTML = '<div class="admin-card" style="margin-top:8px">Integration not found</div>'; return; }
+
+      const statusColor = srv.last_test_status === 'ok' ? 'var(--green,#50fa7b)' : srv.last_test_status === 'error' ? 'var(--red)' : 'var(--fg)';
+      const statusText = srv.last_test_status === 'ok' ? 'Verified' : srv.last_test_status === 'error' ? `Auth failed: ${esc(srv.last_test_output || 'unknown')}` : 'Not tested yet';
+      const isAws = srv.kind === 'aws_cli';
+      const bodyHtml = isAws
+        ? `<div style="font-size:11px;opacity:0.6;margin-bottom:6px">Profile <code>${esc(srv.aws_profile)}</code> — key ${esc(srv.aws_access_key_id_masked || '')}… — region ${esc(srv.aws_region || '')}</div>`
+        : `<div style="font-size:11px;opacity:0.6;margin-bottom:6px">${esc(srv.ssh_user)}@${esc(srv.host)}:${srv.port}</div>
+           <div style="font-size:11px;opacity:0.6;margin-bottom:4px">Public key (add to the host's SSH keys settings):</div>
+           <textarea readonly style="width:100%;font-family:monospace;font-size:10px;height:54px;background:var(--panel-2,#0f0f0f);border:1px solid var(--border);border-radius:6px;color:var(--fg);padding:6px;resize:vertical;">${esc(srv.public_key || '')}</textarea>`;
+      formEl.innerHTML = `
+        <div class="admin-card" style="margin-top:8px">
+          <h2 style="font-size:13px">${esc(srv.name)}</h2>
+          <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px">
+            <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${statusColor}"></span>
+            <span style="font-size:11px;opacity:0.7">${statusText}</span>
+          </div>
+          ${bodyHtml}
+          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:8px;justify-content:flex-end;">
+            <span id="uf-cli-msg" style="font-size:11px;flex:1;margin-right:8px"></span>
+            ${isAws ? '' : '<button class="admin-btn-add" id="uf-cli-copy" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">Copy key</button>'}
+            <button class="admin-btn-add" id="uf-cli-test" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">Test connection</button>
+            <button class="admin-btn-add" id="uf-cli-toggle" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">${srv.is_enabled ? 'Disable' : 'Enable'}</button>
+            <button class="admin-btn-add" id="uf-cli-cancel" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">Close</button>
+          </div>
+        </div>`;
+      if (!isAws) el('uf-cli-copy').addEventListener('click', async () => {
+        try { await navigator.clipboard.writeText(srv.public_key || ''); el('uf-cli-msg').textContent = 'Copied'; } catch (_) { el('uf-cli-msg').textContent = 'Copy failed'; }
+      });
+      el('uf-cli-test').addEventListener('click', async () => {
+        const msg = el('uf-cli-msg'); msg.textContent = 'Testing…';
+        try {
+          const r = await fetch(`/api/cli/integrations/${srv.id}/test`, { method: 'POST', credentials: 'same-origin' });
+          const d = await r.json();
+          msg.textContent = d.last_test_status === 'ok' ? 'Verified' : `Failed: ${d.last_test_output || 'unknown'}`;
+          showCliForm(editId);
+        } catch (_) { msg.textContent = 'Test request failed'; }
+      });
+      el('uf-cli-toggle').addEventListener('click', async () => {
+        await fetch(`/api/cli/integrations/${srv.id}`, {
+          method: 'PATCH', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ is_enabled: !srv.is_enabled }),
+        });
+        await renderList();
+        showCliForm(editId);
+      });
+      el('uf-cli-cancel').addEventListener('click', () => { formEl.style.display = 'none'; });
+      return;
+    }
+
+    // Create flow — kind selector switches the field set below it
+    formEl.innerHTML = `
+      <div class="admin-card" style="margin-top:8px">
+        <h2 style="font-size:13px">Add CLI Integration</h2>
+        <label style="font-size:11px;opacity:0.7;display:block;margin-bottom:2px">Kind</label>
+        <select id="uf-cli-kind" style="width:100%;margin-bottom:10px;padding:6px;background:var(--panel-2,#0f0f0f);border:1px solid var(--border);border-radius:6px;color:var(--fg);">
+          <option value="git_ssh">Git (SSH keypair)</option>
+          <option value="aws_cli">AWS CLI (access key)</option>
+        </select>
+        <div id="uf-cli-fields-git">
+          <div style="font-size:11px;opacity:0.6;margin-bottom:10px">Generates a dedicated SSH keypair. You'll add the public key to the host's account settings (e.g. GitHub → Settings → SSH Keys) before it can connect.</div>
+          <label style="font-size:11px;opacity:0.7;display:block;margin-bottom:2px">Name</label>
+          <input type="text" id="uf-cli-name" placeholder="e.g. GitHub" style="width:100%;margin-bottom:8px;padding:6px;background:var(--panel-2,#0f0f0f);border:1px solid var(--border);border-radius:6px;color:var(--fg);">
+          <label style="font-size:11px;opacity:0.7;display:block;margin-bottom:2px">Host</label>
+          <input type="text" id="uf-cli-host" placeholder="e.g. github.com" style="width:100%;margin-bottom:8px;padding:6px;background:var(--panel-2,#0f0f0f);border:1px solid var(--border);border-radius:6px;color:var(--fg);">
+          <div style="display:flex;gap:8px;">
+            <div style="flex:1">
+              <label style="font-size:11px;opacity:0.7;display:block;margin-bottom:2px">Port</label>
+              <input type="number" id="uf-cli-port" value="22" style="width:100%;margin-bottom:8px;padding:6px;background:var(--panel-2,#0f0f0f);border:1px solid var(--border);border-radius:6px;color:var(--fg);">
+            </div>
+            <div style="flex:1">
+              <label style="font-size:11px;opacity:0.7;display:block;margin-bottom:2px">SSH user</label>
+              <input type="text" id="uf-cli-user" value="git" style="width:100%;margin-bottom:8px;padding:6px;background:var(--panel-2,#0f0f0f);border:1px solid var(--border);border-radius:6px;color:var(--fg);">
+            </div>
+          </div>
+        </div>
+        <div id="uf-cli-fields-aws" style="display:none">
+          <div style="font-size:11px;opacity:0.6;margin-bottom:10px">Stores the key in a dedicated AWS CLI profile (~/.aws). Use an IAM user scoped to only what the agent needs.</div>
+          <label style="font-size:11px;opacity:0.7;display:block;margin-bottom:2px">Name</label>
+          <input type="text" id="uf-cli-aws-name" placeholder="e.g. AWS (Studycast)" style="width:100%;margin-bottom:8px;padding:6px;background:var(--panel-2,#0f0f0f);border:1px solid var(--border);border-radius:6px;color:var(--fg);">
+          <label style="font-size:11px;opacity:0.7;display:block;margin-bottom:2px">Access key ID</label>
+          <input type="text" id="uf-cli-aws-key" style="width:100%;margin-bottom:8px;padding:6px;background:var(--panel-2,#0f0f0f);border:1px solid var(--border);border-radius:6px;color:var(--fg);">
+          <label style="font-size:11px;opacity:0.7;display:block;margin-bottom:2px">Secret access key</label>
+          <input type="password" id="uf-cli-aws-secret" style="width:100%;margin-bottom:8px;padding:6px;background:var(--panel-2,#0f0f0f);border:1px solid var(--border);border-radius:6px;color:var(--fg);">
+          <label style="font-size:11px;opacity:0.7;display:block;margin-bottom:2px">Region</label>
+          <input type="text" id="uf-cli-aws-region" value="us-east-1" style="width:100%;margin-bottom:8px;padding:6px;background:var(--panel-2,#0f0f0f);border:1px solid var(--border);border-radius:6px;color:var(--fg);">
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:4px;justify-content:flex-end;">
+          <span id="uf-cli-create-msg" style="font-size:11px;flex:1;margin-right:8px"></span>
+          <button class="admin-btn-add" id="uf-cli-create-cancel" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">Cancel</button>
+          <button class="admin-btn-add" id="uf-cli-create-save">Save</button>
+        </div>
+      </div>`;
+    const kindSel = el('uf-cli-kind');
+    const gitFields = el('uf-cli-fields-git');
+    const awsFields = el('uf-cli-fields-aws');
+    kindSel.addEventListener('change', () => {
+      const isAws = kindSel.value === 'aws_cli';
+      gitFields.style.display = isAws ? 'none' : '';
+      awsFields.style.display = isAws ? '' : 'none';
+    });
+    el('uf-cli-create-cancel').addEventListener('click', () => { formEl.style.display = 'none'; });
+    el('uf-cli-create-save').addEventListener('click', async () => {
+      const msg = el('uf-cli-create-msg');
+      const kind = kindSel.value;
+      let payload;
+      if (kind === 'aws_cli') {
+        const name = el('uf-cli-aws-name').value.trim();
+        const aws_access_key_id = el('uf-cli-aws-key').value.trim();
+        const aws_secret_access_key = el('uf-cli-aws-secret').value.trim();
+        const aws_region = el('uf-cli-aws-region').value.trim() || 'us-east-1';
+        if (!name || !aws_access_key_id || !aws_secret_access_key) { msg.textContent = 'Name, access key, and secret are required'; return; }
+        payload = { kind, name, aws_access_key_id, aws_secret_access_key, aws_region };
+      } else {
+        const name = el('uf-cli-name').value.trim();
+        const host = el('uf-cli-host').value.trim();
+        const port = parseInt(el('uf-cli-port').value, 10) || 22;
+        const ssh_user = el('uf-cli-user').value.trim() || 'git';
+        if (!name || !host) { msg.textContent = 'Name and host are required'; return; }
+        payload = { kind, name, host, port, ssh_user };
+      }
+      msg.textContent = 'Saving…';
+      try {
+        const r = await fetch('/api/cli/integrations', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const d = await r.json();
+        if (!r.ok) { msg.textContent = d.detail || 'Failed'; return; }
+        await renderList();
+        showCliForm(d.id);
+      } catch (_) { msg.textContent = 'Request failed'; }
+    });
+  }
+
+  // ── SSH connection form (generic remote-host access via the `bash` tool) ──
+  async function showSshForm(editId) {
+    const esc = s => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    let srv = null;
+    if (editId && editId !== 'new') {
+      formEl.innerHTML = '<div class="admin-card" style="margin-top:8px"><span style="opacity:0.5;font-size:11px">Loading...</span></div>';
+      try {
+        const res = await fetch('/api/ssh/connections', { credentials: 'same-origin' });
+        const list = await res.json();
+        srv = list.find(s => s.id === editId);
+      } catch (_) {}
+      if (!srv) { formEl.innerHTML = '<div class="admin-card" style="margin-top:8px">Connection not found</div>'; return; }
+
+      const statusColor = srv.last_test_status === 'ok' ? 'var(--green,#50fa7b)' : srv.last_test_status === 'error' ? 'var(--red)' : 'var(--fg)';
+      const statusText = srv.last_test_status === 'ok' ? 'Verified' : srv.last_test_status === 'error' ? `Auth failed: ${esc(srv.last_test_output || 'unknown')}` : 'Not tested yet';
+      const isPassword = srv.auth_method === 'password';
+      const bodyHtml = isPassword
+        ? `<div style="font-size:11px;opacity:0.6;margin-bottom:4px">Run this to connect (password is stored, not shown):</div>
+           <textarea readonly style="width:100%;font-family:monospace;font-size:10px;height:34px;background:var(--panel-2,#0f0f0f);border:1px solid var(--border);border-radius:6px;color:var(--fg);padding:6px;resize:vertical;">${esc(srv.connect_command || '')}</textarea>`
+        : `<div style="font-size:11px;opacity:0.6;margin-bottom:4px">Public key (add to the host's authorized_keys):</div>
+           <textarea readonly style="width:100%;font-family:monospace;font-size:10px;height:54px;background:var(--panel-2,#0f0f0f);border:1px solid var(--border);border-radius:6px;color:var(--fg);padding:6px;resize:vertical;">${esc(srv.public_key || '')}</textarea>`;
+      formEl.innerHTML = `
+        <div class="admin-card" style="margin-top:8px">
+          <h2 style="font-size:13px">${esc(srv.name)}</h2>
+          <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px">
+            <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${statusColor}"></span>
+            <span style="font-size:11px;opacity:0.7">${statusText}</span>
+          </div>
+          <div style="font-size:11px;opacity:0.6;margin-bottom:6px">${esc(srv.ssh_user)}@${esc(srv.host)}:${srv.port} — ${isPassword ? 'password auth' : 'key auth'}</div>
+          ${srv.note ? `<div style="font-size:11px;opacity:0.5;margin-bottom:6px">${esc(srv.note)}</div>` : ''}
+          ${bodyHtml}
+          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:8px;justify-content:flex-end;">
+            <span id="uf-ssh-msg" style="font-size:11px;flex:1;margin-right:8px"></span>
+            <button class="admin-btn-add" id="uf-ssh-copy" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">${isPassword ? 'Copy command' : 'Copy key'}</button>
+            <button class="admin-btn-add" id="uf-ssh-test" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">Test connection</button>
+            <button class="admin-btn-add" id="uf-ssh-toggle" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">${srv.is_enabled ? 'Disable' : 'Enable'}</button>
+            <button class="admin-btn-add" id="uf-ssh-cancel" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">Close</button>
+          </div>
+        </div>`;
+      el('uf-ssh-copy').addEventListener('click', async () => {
+        try { await navigator.clipboard.writeText((isPassword ? srv.connect_command : srv.public_key) || ''); el('uf-ssh-msg').textContent = 'Copied'; } catch (_) { el('uf-ssh-msg').textContent = 'Copy failed'; }
+      });
+      el('uf-ssh-test').addEventListener('click', async () => {
+        const msg = el('uf-ssh-msg'); msg.textContent = 'Testing…';
+        try {
+          const r = await fetch(`/api/ssh/connections/${srv.id}/test`, { method: 'POST', credentials: 'same-origin' });
+          const d = await r.json();
+          msg.textContent = d.last_test_status === 'ok' ? 'Verified' : `Failed: ${d.last_test_output || 'unknown'}`;
+          showSshForm(editId);
+        } catch (_) { msg.textContent = 'Test request failed'; }
+      });
+      el('uf-ssh-toggle').addEventListener('click', async () => {
+        await fetch(`/api/ssh/connections/${srv.id}`, {
+          method: 'PATCH', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ is_enabled: !srv.is_enabled }),
+        });
+        await renderList();
+        showSshForm(editId);
+      });
+      el('uf-ssh-cancel').addEventListener('click', () => { formEl.style.display = 'none'; });
+      return;
+    }
+
+    // Create flow
+    formEl.innerHTML = `
+      <div class="admin-card" style="margin-top:8px">
+        <h2 style="font-size:13px">Add SSH Connection</h2>
+        <div style="font-size:11px;opacity:0.6;margin-bottom:10px">For direct access to a server (not a git remote).</div>
+        <label style="font-size:11px;opacity:0.7;display:block;margin-bottom:2px">Name</label>
+        <input type="text" id="uf-ssh-name" placeholder="e.g. Studycast App Server" style="width:100%;margin-bottom:8px;padding:6px;background:var(--panel-2,#0f0f0f);border:1px solid var(--border);border-radius:6px;color:var(--fg);">
+        <label style="font-size:11px;opacity:0.7;display:block;margin-bottom:2px">Host</label>
+        <input type="text" id="uf-ssh-host" placeholder="e.g. 10.0.1.20 or app.internal" style="width:100%;margin-bottom:8px;padding:6px;background:var(--panel-2,#0f0f0f);border:1px solid var(--border);border-radius:6px;color:var(--fg);">
+        <div style="display:flex;gap:8px;">
+          <div style="flex:1">
+            <label style="font-size:11px;opacity:0.7;display:block;margin-bottom:2px">Port</label>
+            <input type="number" id="uf-ssh-port" value="22" style="width:100%;margin-bottom:8px;padding:6px;background:var(--panel-2,#0f0f0f);border:1px solid var(--border);border-radius:6px;color:var(--fg);">
+          </div>
+          <div style="flex:1">
+            <label style="font-size:11px;opacity:0.7;display:block;margin-bottom:2px">SSH user</label>
+            <input type="text" id="uf-ssh-user" value="root" style="width:100%;margin-bottom:8px;padding:6px;background:var(--panel-2,#0f0f0f);border:1px solid var(--border);border-radius:6px;color:var(--fg);">
+          </div>
+        </div>
+        <label style="font-size:11px;opacity:0.7;display:block;margin-bottom:2px">Auth method</label>
+        <select id="uf-ssh-auth-method" style="width:100%;margin-bottom:8px;padding:6px;background:var(--panel-2,#0f0f0f);border:1px solid var(--border);border-radius:6px;color:var(--fg);">
+          <option value="key">SSH keypair (generated, you add the public key to the host)</option>
+          <option value="password">Username + password (stored encrypted)</option>
+        </select>
+        <div id="uf-ssh-password-field" style="display:none">
+          <label style="font-size:11px;opacity:0.7;display:block;margin-bottom:2px">Password</label>
+          <input type="password" id="uf-ssh-password" style="width:100%;margin-bottom:8px;padding:6px;background:var(--panel-2,#0f0f0f);border:1px solid var(--border);border-radius:6px;color:var(--fg);">
+        </div>
+        <label style="font-size:11px;opacity:0.7;display:block;margin-bottom:2px">Note (optional)</label>
+        <input type="text" id="uf-ssh-note" placeholder="what this box is for" style="width:100%;margin-bottom:8px;padding:6px;background:var(--panel-2,#0f0f0f);border:1px solid var(--border);border-radius:6px;color:var(--fg);">
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:4px;justify-content:flex-end;">
+          <span id="uf-ssh-create-msg" style="font-size:11px;flex:1;margin-right:8px"></span>
+          <button class="admin-btn-add" id="uf-ssh-create-cancel" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">Cancel</button>
+          <button class="admin-btn-add" id="uf-ssh-create-save">Save</button>
+        </div>
+      </div>`;
+    const authSel = el('uf-ssh-auth-method');
+    const pwField = el('uf-ssh-password-field');
+    authSel.addEventListener('change', () => { pwField.style.display = authSel.value === 'password' ? '' : 'none'; });
+    el('uf-ssh-create-cancel').addEventListener('click', () => { formEl.style.display = 'none'; });
+    el('uf-ssh-create-save').addEventListener('click', async () => {
+      const msg = el('uf-ssh-create-msg');
+      const name = el('uf-ssh-name').value.trim();
+      const host = el('uf-ssh-host').value.trim();
+      const port = parseInt(el('uf-ssh-port').value, 10) || 22;
+      const ssh_user = el('uf-ssh-user').value.trim() || 'root';
+      const note = el('uf-ssh-note').value.trim();
+      const auth_method = authSel.value;
+      if (!name || !host) { msg.textContent = 'Name and host are required'; return; }
+      const payload = { name, host, port, ssh_user, note, auth_method };
+      if (auth_method === 'password') {
+        const password = el('uf-ssh-password').value;
+        if (!password) { msg.textContent = 'Password is required'; return; }
+        payload.password = password;
+      }
+      msg.textContent = 'Saving…';
+      try {
+        const r = await fetch('/api/ssh/connections', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const d = await r.json();
+        if (!r.ok) { msg.textContent = d.detail || 'Failed'; return; }
+        await renderList();
+        showSshForm(d.id);
+      } catch (_) { msg.textContent = 'Request failed'; }
+    });
   }
 
   async function showAgentForm(kind, editId) {
@@ -5645,9 +6184,12 @@ async function initUnifiedIntegrations() {
       ['claude', 'Claude Agent'],
       ['codex', 'Codex Agent'],
       ['carddav', 'Contacts (CardDAV)'],
+      ['cli', 'CLI / Git (SSH)'],
       ['contacts', 'Contacts Import'],
       ['email', 'Email (IMAP/SMTP)'],
       ['mcp', 'MCP Tool Server'],
+      ['ssh', 'SSH Connection'],
+      ['telegram', 'Telegram'],
     ];
     const _iconFor = (k) => (INTG_TYPES[k]?.icon || '').replace(/width="14"/, 'width="16"').replace(/height="14"/, 'height="16"');
     const _rowsHtml = _typeOptions.map(([k, label]) => `<button type="button" class="uf-type-option" data-value="${k}" style="display:flex;align-items:center;gap:10px;width:100%;padding:8px 10px;background:transparent;border:0;color:var(--fg);font:inherit;cursor:pointer;text-align:left;"><span style="display:inline-flex;color:var(--accent, var(--red));flex-shrink:0;">${_iconFor(k)}</span><span>${esc(label)}</span></button>`).join('');

@@ -266,6 +266,15 @@ if AUTH_ENABLED:
         "/api/health",
         "/api/version",
         "/login",
+        # The redirect leg of the generic MCP OAuth flow (RFC 9728 / Dynamic
+        # Client Registration, e.g. Atlassian). The browser tab handling this
+        # redirect doesn't reliably carry the admin session cookie through the
+        # remote-authorization-server bounce, and doesn't need to: `state` is
+        # a server-generated, unguessable secret tied to a live pending Future
+        # (see register_pending/resolve_pending in src/mcp_oauth.py) that only
+        # an admin-initiated reconnect could have created — the same
+        # path-is-the-credential model as the /webhook/ exemption below.
+        "/api/mcp/oauth/callback",
     }
     AUTH_EXEMPT_PREFIXES = ["/static"]
     # Dynamic paths whose own handler proves identity via a path-embedded
@@ -807,6 +816,16 @@ set_mcp_manager(mcp_manager)
 app.include_router(setup_mcp_routes(mcp_manager))
 logger.info("MCP routes initialized")
 
+# CLI integrations (per-host SSH keys for git / AWS CLI creds, used by the `bash` tool)
+from routes.cli_integration_routes import setup_cli_integration_routes
+app.include_router(setup_cli_integration_routes())
+logger.info("CLI integration routes initialized")
+
+# SSH connections (generic remote-host SSH access, separate from git remotes)
+from routes.ssh_connection_routes import setup_ssh_connection_routes
+app.include_router(setup_ssh_connection_routes())
+logger.info("SSH connection routes initialized")
+
 # AI Interaction tools (debates, pipelines, self-managing AI, UI control)
 from src.ai_interaction import set_session_manager as set_ai_session_manager, set_memory_manager as set_ai_memory_manager, set_rag_manager as set_ai_rag_manager
 set_ai_session_manager(session_manager)
@@ -823,6 +842,12 @@ from routes.api_token_routes import setup_api_token_routes
 app.include_router(setup_api_token_routes())
 
 logger.info("Webhook & API token routes initialized")
+
+# Telegram bot bridge
+from routes.telegram_routes import setup_telegram_routes
+from src.telegram_bot import telegram_bot
+app.include_router(setup_telegram_routes(telegram_bot))
+logger.info("Telegram routes initialized")
 
 # Notes (Google Keep-style notes/todos)
 from routes.note_routes import setup_note_routes
@@ -1043,9 +1068,12 @@ async def _startup_event():
         except BaseException as e:
             logger.warning(f"Built-in MCP registration failed (non-critical): {type(e).__name__}: {e}")
         try:
-            await asyncio.wait_for(mcp_manager.connect_all_enabled(), timeout=20)
-        except asyncio.TimeoutError:
-            logger.warning("User MCP startup timed out (non-critical)")
+            # connect_all_enabled now connects servers concurrently and bounds
+            # each one with its own timeout, so a single slow/blocked server no
+            # longer starves the rest. No shared umbrella timeout here — that was
+            # what previously cancelled the whole pass mid-loop and left later
+            # servers disconnected.
+            await mcp_manager.connect_all_enabled()
         except BaseException as e:
             logger.warning(f"MCP startup failed (non-critical): {type(e).__name__}: {e}")
 
@@ -1239,6 +1267,13 @@ async def _startup_event():
     from src.cookbook_serve_lifecycle import cookbook_serve_lifecycle_loop
     _startup_tasks.append(asyncio.create_task(cookbook_serve_lifecycle_loop()))
 
+    # Telegram bot — no-op if never configured (config row absent or disabled).
+    try:
+        from src.telegram_bot import telegram_bot
+        await telegram_bot.start()
+    except Exception as e:
+        logger.warning("Telegram bot startup failed (non-critical): %s", e)
+
     logger.info("Application startup complete")
 
 async def _shutdown_event():
@@ -1249,6 +1284,12 @@ async def _shutdown_event():
             await upload_cleanup_task
         except asyncio.CancelledError:
             pass
+    # Stop Telegram polling
+    try:
+        from src.telegram_bot import telegram_bot
+        await telegram_bot.stop()
+    except Exception:
+        pass
     # Stop task scheduler (no-op if it never started under the gate)
     try:
         await task_scheduler.stop()
