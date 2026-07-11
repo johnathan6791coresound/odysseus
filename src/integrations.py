@@ -139,6 +139,26 @@ INTEGRATION_PRESETS: Dict[str, Dict[str, Any]] = {
             "  that must be decrypted client-side with the user's master key."
         ),
     },
+    "n8n": {
+        "name": "n8n",
+        "auth_type": "header",
+        "auth_header": "X-N8N-API-KEY",
+        "description": (
+            "n8n workflow automation public API (v1). Key endpoints:\n"
+            "  GET /api/v1/workflows — list workflows (params: active, limit, cursor)\n"
+            "  GET /api/v1/workflows/{id} — get a workflow's full definition (nodes/connections)\n"
+            "  POST /api/v1/workflows — create a workflow {\"name\":..., \"nodes\":[...], \"connections\":{...}, \"settings\":{}}\n"
+            "  PUT /api/v1/workflows/{id} — update a workflow (send the full workflow object)\n"
+            "  DELETE /api/v1/workflows/{id} — delete a workflow\n"
+            "  POST /api/v1/workflows/{id}/activate — activate (enables its triggers)\n"
+            "  POST /api/v1/workflows/{id}/deactivate — deactivate\n"
+            "  GET /api/v1/executions — list executions (params: workflowId, status, limit)\n"
+            "  GET /api/v1/executions/{id} — get a single execution's data\n"
+            "  Note: the public API has no 'run now' endpoint. To trigger a workflow on demand it must "
+            "have a Webhook trigger node — POST to {base_url}/webhook/{path} (production) or "
+            "{base_url}/webhook-test/{path} (test listener), no API key needed on that call."
+        ),
+    },
     "freshrss": {
         "name": "FreshRSS",
         "auth_type": "header",

@@ -415,6 +415,16 @@ class TaskScheduler:
         if len(self._pending_notifications) > 50:
             self._pending_notifications = self._pending_notifications[-50:]
 
+        # Best-effort mirror to any Telegram chat(s) linked to this owner.
+        # Fire-and-forget: a Telegram outage must never block task completion.
+        if owner:
+            try:
+                from src.telegram_bot import telegram_bot
+                text = f"[{task_name}] {status}" + (f"\n{body}" if body else "")
+                asyncio.ensure_future(telegram_bot.notify_owner(owner, text))
+            except Exception as e:
+                logger.debug(f"Telegram notification skipped: {e}")
+
     def pop_notifications(self, owner: str = None) -> list:
         """Return and clear pending notifications.
 
@@ -754,7 +764,7 @@ class TaskScheduler:
                     task_id,
                     run_id,
                     release_executing=release_executing,
-                    gate_foreground=not bypass_model_slot,
+                    gate_foreground=not bypass_model_slot and not self._task_skips_foreground_gate(task_id),
                 )
                 return
 
@@ -909,6 +919,12 @@ class TaskScheduler:
             try:
                 if task_type == "action":
                     result, success = await self._execute_action(task, run_id=run_id)
+                    run.status = "success" if success else "error"
+                    run.result = result
+                    if not success:
+                        run.error = result
+                elif task_type == "n8n_trigger":
+                    result, success = await self._execute_n8n_trigger(task)
                     run.status = "success" if success else "error"
                     run.result = result
                     if not success:
@@ -1206,9 +1222,27 @@ class TaskScheduler:
             if not task:
                 return True
             task_type = getattr(task, "task_type", "") or "llm"
+            if task_type == "n8n_trigger":
+                return False
             if task_type != "action":
                 return True
             return (getattr(task, "action", "") or "") in self._MODEL_BACKED_ACTIONS
+        finally:
+            db.close()
+
+    def _task_skips_foreground_gate(self, task_id: str) -> bool:
+        """n8n_trigger fires an independent webhook on a separate server — it
+        doesn't touch Odysseus's own model/agent resources, so there's no
+        reason to make it wait for the interactive-quiet window the way a
+        model-backed task should. Built-in `action` housekeeping tasks are
+        NOT included here: some of those (ssh_command, run_script) do compete
+        for local resources, so their existing gated behavior is preserved."""
+        from core.database import SessionLocal, ScheduledTask
+
+        db = SessionLocal()
+        try:
+            task = db.query(ScheduledTask).filter(ScheduledTask.id == task_id).first()
+            return bool(task) and (getattr(task, "task_type", "") or "") == "n8n_trigger"
         finally:
             db.close()
 
@@ -1258,6 +1292,43 @@ class TaskScheduler:
         except Exception as e:
             logger.error(f"Action '{task.action}' failed: {e}")
             return str(e), False
+
+    async def _execute_n8n_trigger(self, task) -> tuple:
+        """Fire an n8n workflow's webhook on this task's schedule. No LLM
+        involved — mirrors _execute_action's shape (result, success). The
+        target workflow's ID is stored in task.action (same column
+        task_type="action" uses for its builtin action name) — a stable
+        reference, unlike a raw webhook path which breaks if the workflow's
+        owner renames the path. do_manage_n8n resolves the current webhook
+        path from the workflow's node list at trigger time. An optional JSON
+        body to POST is stored in task.prompt as a raw JSON string."""
+        import json as _json
+        from src.agent_tools.n8n_tools import do_manage_n8n
+
+        workflow_id = task.action
+        if not workflow_id:
+            return "No n8n workflow configured for this trigger task", False
+
+        body = None
+        if task.prompt:
+            try:
+                body = _json.loads(task.prompt)
+            except (ValueError, TypeError):
+                return f"task.prompt is not valid JSON for the webhook body: {task.prompt[:200]}", False
+
+        try:
+            result = await do_manage_n8n(_json.dumps({
+                "action": "trigger",
+                "workflow_id": workflow_id,
+                "body": body,
+            }))
+        except Exception as e:
+            logger.error(f"n8n trigger for workflow '{workflow_id}' failed: {e}")
+            return str(e), False
+
+        if result.get("exit_code", 1) == 0:
+            return result.get("output", "Triggered"), True
+        return result.get("error", "n8n trigger failed"), False
 
     # ── Check-in source discovery ──
     # Pattern-based: if an MCP server has a tool matching a pattern, it becomes

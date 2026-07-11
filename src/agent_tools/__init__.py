@@ -23,7 +23,7 @@ from .subprocess_tools import BashTool, PythonTool
 from .web_tools import WebSearchTool, WebFetchTool
 from .filesystem_tools import ReadFileTool, WriteFileTool, EditFileTool, LsTool, GlobTool, GrepTool, GetWorkspaceTool
 from .document_tools import CreateDocumentTool, UpdateDocumentTool, EditDocumentTool, SuggestDocumentTool, ManageDocumentTool
-from .interaction_tools import AskUserTool, UpdatePlanTool
+from .interaction_tools import AskUserTool, UpdatePlanTool, LoadToolsTool
 from .model_interaction_tools import ChatWithModelTool, AskTeacherTool, ListModelsTool
 from .bg_job_tools import ManageBgJobsTool
 from .session_tools import CreateSessionTool, ListSessionsTool, SendToSessionTool, ManageSessionTool
@@ -32,6 +32,7 @@ from .admin_tools import (
     do_manage_endpoints, do_manage_mcp, do_manage_webhooks,
     do_manage_tokens, do_manage_settings,
 )
+from .n8n_tools import do_manage_n8n
 
 TOOL_HANDLERS = {
     "bash": BashTool().execute,
@@ -52,6 +53,7 @@ TOOL_HANDLERS = {
     "get_workspace": GetWorkspaceTool().execute,
     "ask_user": AskUserTool().execute,
     "update_plan": UpdatePlanTool().execute,
+    "load_tools": LoadToolsTool().execute,
     "chat_with_model": ChatWithModelTool().execute,
     "ask_teacher": AskTeacherTool().execute,
     "list_models": ListModelsTool().execute,
@@ -63,6 +65,7 @@ TOOL_HANDLERS = {
 }
 # Config/integration admin tools (manage_endpoints/mcp/webhooks/tokens/settings).
 TOOL_HANDLERS.update(ADMIN_TOOL_HANDLERS)
+TOOL_HANDLERS["manage_n8n"] = lambda content, ctx: do_manage_n8n(content, ctx.get("owner"))
 
 # ---------------------------------------------------------------------------
 # Constants (re-exported for backward compatibility — single source of truth
@@ -81,11 +84,12 @@ TOOL_TAGS = {"bash", "python", "web_search", "web_fetch", "read_file", "write_fi
              "send_to_session",
              "pipeline",
              "manage_session", "manage_memory", "list_models",
-             "ui_control", "generate_image", "ask_user", "update_plan",
+             "ui_control", "generate_image", "ask_user", "update_plan", "load_tools",
              "manage_tasks", "api_call", "ask_teacher", "manage_skills",
              "suggest_document",
              "manage_endpoints", "manage_mcp", "manage_webhooks",
              "manage_tokens", "manage_documents", "manage_settings",
+             "manage_n8n",
              "manage_notes", "manage_calendar",
              "resolve_contact", "manage_contact",
              # Email tool names come from BUILTIN_EMAIL_TOOLS (unioned below)

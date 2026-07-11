@@ -497,6 +497,24 @@ FUNCTION_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "load_tools",
+            "description": "Load one or more real tools by exact name from the tool catalog in the system prompt so you can call them for real this turn and every future message in this session. The catalog lists every tool that exists (name + one-line description) but only ALWAYS-AVAILABLE tools and anything already loaded have a real schema you can call yet.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Exact tool name(s) from the catalog to load, e.g. [\"send_email\"] or [\"send_email\", \"manage_calendar\"]."
+                    }
+                },
+                "required": ["names"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "update_plan",
             "description": "Write back to the ACTIVE PLAN: mark steps done or revise them. Use this while executing an approved plan — after you finish a step, call update_plan with the full checklist and that step marked `- [x]`; when the user asks to change the plan, call it with the revised checklist. The user's docked plan window updates live. Pass the COMPLETE checklist every time (not a diff). No effect if there is no active plan.",
             "parameters": {
@@ -521,15 +539,10 @@ FUNCTION_TOOL_SCHEMAS = [
                     "task_id": {"type": "string", "description": "Task ID (for edit/delete/pause/resume/run)"},
                     "name": {"type": "string", "description": "Task name"},
                     "prompt": {"type": "string", "description": "The instruction (for task_type=llm) or the research question (for task_type=research). Required for both."},
-                    "task_type": {"type": "string", "enum": ["llm", "research", "action"],
-                                  "description": "llm = AI runs your prompt; research = runs the deep-research pipeline on the prompt as a question; action = direct built-in function"},
-                    "action_name": {"type": "string", "enum": [
-                        "tidy_sessions", "tidy_documents", "consolidate_memory", "tidy_research",
-                        "summarize_emails", "draft_email_replies", "extract_email_events",
-                        "classify_events", "learn_sender_signatures",
-                        "test_skills", "audit_skills", "check_email_urgency"
-                    ],
-                                    "description": "Built-in action (for task_type=action)"},
+                    "task_type": {"type": "string", "enum": ["llm", "research", "action", "n8n_trigger"],
+                                  "description": "llm = AI runs your prompt; research = runs the deep-research pipeline on the prompt as a question; action = direct built-in function; n8n_trigger = fires an n8n workflow on this schedule (no LLM) — set action_name to the workflow's ID (see manage_n8n action=list to find it; the webhook path is resolved automatically at trigger time) and optionally prompt to a JSON string used as the webhook POST body. The workflow must have a Webhook trigger node."},
+                    "action_name": {"type": "string",
+                                    "description": "For task_type=action: one of tidy_sessions, tidy_documents, consolidate_memory, tidy_research, summarize_emails, draft_email_replies, extract_email_events, classify_events, learn_sender_signatures, test_skills, audit_skills, check_email_urgency. For task_type=n8n_trigger: the n8n workflow's ID instead (from manage_n8n action=list) — NOT the webhook path, that's resolved automatically."},
                     "trigger_type": {"type": "string", "enum": ["schedule", "event"],
                                      "description": "schedule = time-based, event = count-based"},
                     "schedule": {"type": "string", "enum": ["once", "daily", "weekly", "monthly"],
@@ -737,6 +750,37 @@ FUNCTION_TOOL_SCHEMAS = [
                     "name": {"type": "string", "description": "Webhook name (for add)"},
                     "url": {"type": "string", "description": "Webhook URL (for add)"},
                     "events": {"type": "string", "description": "Comma-separated event names (for add)"}
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_n8n",
+            "description": "Manage n8n workflows on the connected n8n automation server: list, get, create, update, delete, activate/deactivate workflows; trigger a workflow run via its webhook path; list/inspect executions. Requires an 'n8n' integration already registered with base URL + API key. NOT for Odysseus's own scheduled tasks — use manage_tasks for those.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": [
+                        "list", "get", "create", "update", "delete",
+                        "activate", "deactivate", "trigger",
+                        "list_executions", "get_execution"
+                    ], "description": "The action to perform"},
+                    "workflow_id": {"type": "string", "description": "Workflow ID (for get/update/delete/activate/deactivate/list_executions, and optionally trigger — its webhook path is auto-resolved from the workflow's Webhook node)"},
+                    "name": {"type": "string", "description": "Workflow name (for create/update)"},
+                    "nodes": {"type": "array", "items": {"type": "object"}, "description": "n8n node definitions (for create/update) — array of node objects with id/name/type/typeVersion/position/parameters"},
+                    "connections": {"type": "object", "description": "n8n connections graph linking node outputs to inputs (for create/update)"},
+                    "settings": {"type": "object", "description": "Workflow settings object, e.g. executionOrder (for create/update)"},
+                    "webhook_path": {"type": "string", "description": "The Webhook trigger node's path (for trigger) — e.g. 'standup-digest-test'. Optional if workflow_id is given instead — the workflow's webhook path AND configured HTTP method are then looked up automatically. If webhook_path is given directly, method defaults to POST unless `method` is also set."},
+                    "method": {"type": "string", "description": "HTTP method for trigger when webhook_path is given directly (default POST). Ignored when workflow_id is used — the real configured method is resolved from the node."},
+                    "test": {"type": "boolean", "description": "For trigger: true hits the workflow's test webhook listener (/webhook-test/), false hits the always-on production path (/webhook/). Default false."},
+                    "body": {"type": "object", "description": "JSON body to POST to the webhook (for trigger)"},
+                    "execution_id": {"type": "string", "description": "Execution ID (for get_execution)"},
+                    "status": {"type": "string", "description": "Filter executions by status, e.g. success/error/running (for list_executions)"},
+                    "limit": {"type": "integer", "description": "Max results to return (for list/list_executions)"},
+                    "active": {"type": "boolean", "description": "Filter workflows by active state (for list)"}
                 },
                 "required": ["action"]
             }
@@ -1497,7 +1541,8 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
             content = action
     elif tool_type in ("manage_tasks", "manage_skills", "api_call",
                         "manage_endpoints", "manage_mcp", "manage_webhooks",
-                        "manage_tokens", "manage_documents", "manage_settings"):
+                        "manage_tokens", "manage_documents", "manage_settings",
+                        "manage_n8n"):
         content = json.dumps(args)
     elif tool_type == "ask_teacher":
         content = args.get("model", "auto") + "\n" + args.get("problem", "")

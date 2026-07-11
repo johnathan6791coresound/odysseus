@@ -187,6 +187,19 @@ async function _fetchActions() {
   return _builtinActions;
 }
 
+let _n8nWorkflows = null;
+async function _fetchN8nWorkflows(force) {
+  if (_n8nWorkflows && !force) return _n8nWorkflows;
+  try {
+    const res = await fetch(`${API_BASE}/api/tasks/meta/n8n-workflows`, { credentials: 'same-origin' });
+    const data = await res.json();
+    _n8nWorkflows = data.workflows || [];
+  } catch (e) {
+    _n8nWorkflows = [];
+  }
+  return _n8nWorkflows;
+}
+
 let _urgentEmailSettings = null;
 async function _fetchUrgentEmailSettings() {
   if (_urgentEmailSettings) return _urgentEmailSettings;
@@ -436,13 +449,16 @@ const _TASK_ICONS = {
   _action_default:     '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
   // LLM task fallback (chat bubble)
   _llm_default:        '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+  // n8n trigger fallback (chain link)
+  _n8n_default:        '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
 };
 
 function _taskIcon(task) {
   const action = task.action;
   let path = _TASK_ICONS[action];
   if (!path) {
-    path = task.task_type === 'action' ? _TASK_ICONS._action_default : _TASK_ICONS._llm_default;
+    if (task.task_type === 'n8n_trigger') path = _TASK_ICONS._n8n_default;
+    else path = task.task_type === 'action' ? _TASK_ICONS._action_default : _TASK_ICONS._llm_default;
   }
   return `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.4;flex-shrink:0;position:relative;top:-4px;">${path}</svg>`;
 }
@@ -1152,6 +1168,7 @@ function _showForm(existing, initTaskType, initTriggerType) {
         <button class="task-toggle-btn ${curTaskType === 'llm' ? 'active' : ''}" data-val="llm" style="position:relative;top:-4px;"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:4px;"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>Prompt</button>
         <button class="task-toggle-btn ${curTaskType === 'research' ? 'active' : ''}" data-val="research" style="position:relative;top:-4px;"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:4px;"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>Research</button>
         <button class="task-toggle-btn ${curTaskType === 'action' ? 'active' : ''}" data-val="action" style="position:relative;top:-4px;"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:4px;"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>Action</button>
+        <button class="task-toggle-btn ${curTaskType === 'n8n_trigger' ? 'active' : ''}" data-val="n8n_trigger" style="position:relative;top:-4px;"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:4px;"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>n8n</button>
       </div>
 
       <div id="task-form-type-opts"></div>
@@ -1225,6 +1242,43 @@ function _showForm(existing, initTaskType, initTriggerType) {
         <label class="task-form-label">Persona <span style="opacity:0.5;font-weight:normal;font-size:10px;">(optional — biases the output voice)</span></label>
         <select id="task-form-persona" class="task-form-input">${_personaOptsHtml}</select>
       `;
+    } else if (taskType === 'n8n_trigger') {
+      typeOpts.innerHTML = `
+        <label class="task-form-label">Workflow</label>
+        <select id="task-form-n8n-workflow" class="task-form-input">
+          <option value="">Loading…</option>
+        </select>
+        <label class="task-form-label">Body <span style="opacity:0.5;font-weight:normal;font-size:10px;">(optional — JSON POSTed to the webhook)</span></label>
+        <textarea id="task-form-n8n-body" class="task-form-input task-form-textarea" rows="3" placeholder="{}">${existing?.task_type === 'n8n_trigger' ? (existing?.prompt || '') : ''}</textarea>
+        <div id="task-form-n8n-warning" class="memory-desc" style="font-size:11px;margin-top:4px;"></div>
+      `;
+      _fetchN8nWorkflows().then(workflows => {
+        const sel = document.getElementById('task-form-n8n-workflow');
+        const warn = document.getElementById('task-form-n8n-warning');
+        if (!sel) return;
+        sel.innerHTML = '';
+        if (!workflows.length) {
+          sel.innerHTML = '<option value="">No n8n workflows found</option>';
+          if (warn) warn.textContent = 'No n8n integration/workflows available. Register one via manage_n8n first.';
+          return;
+        }
+        for (const wf of workflows) {
+          const opt = document.createElement('option');
+          opt.value = wf.id;
+          const flags = [!wf.has_webhook ? 'no webhook — not triggerable' : '', !wf.active ? 'inactive' : '']
+            .filter(Boolean).join(', ');
+          opt.textContent = flags ? `${wf.name} (${flags})` : wf.name;
+          opt.disabled = !wf.has_webhook;
+          if (existing?.task_type === 'n8n_trigger' && existing?.action === wf.id) opt.selected = true;
+          sel.appendChild(opt);
+        }
+        const syncWarn = () => {
+          const cur = workflows.find(w => w.id === sel.value);
+          if (warn) warn.textContent = cur && !cur.active ? 'This workflow is inactive in n8n — activate it there for the webhook to respond.' : '';
+        };
+        sel.addEventListener('change', syncWarn);
+        syncWarn();
+      });
     } else {
       typeOpts.innerHTML = `
         <label class="task-form-label">Action</label>
@@ -1636,6 +1690,24 @@ function _showForm(existing, initTaskType, initTriggerType) {
       payload.prompt = prompt;
       const personaVal = document.getElementById('task-form-persona')?.value || '';
       payload.character_id = personaVal;
+    } else if (taskType === 'n8n_trigger') {
+      payload.character_id = '';
+      const workflowId = document.getElementById('task-form-n8n-workflow')?.value;
+      if (!workflowId) {
+        if (uiModule) uiModule.showError('Select an n8n workflow');
+        return;
+      }
+      payload.action = workflowId;
+      const bodyRaw = document.getElementById('task-form-n8n-body')?.value?.trim() || '';
+      if (bodyRaw) {
+        try {
+          JSON.parse(bodyRaw);
+        } catch (e) {
+          if (uiModule) uiModule.showError('Webhook body must be valid JSON');
+          return;
+        }
+      }
+      payload.prompt = bodyRaw || '';
     } else {
       // Non-llm/research tasks: explicitly clear any persona on switch.
       payload.character_id = '';

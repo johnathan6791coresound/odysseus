@@ -42,7 +42,22 @@ ALWAYS_AVAILABLE = frozenset({
     "ask_user",
     # Write back to the active plan (tick steps done / revise) during execution.
     "update_plan",
+    # Pull a real tool's full schema into scope for the rest of this turn
+    # (and persist it on the session for future turns) once the model has
+    # decided, from the always-injected catalog, that it actually needs it.
+    # See build_tool_catalog() / LOAD_TOOLS_DESCRIPTION below.
+    "load_tools",
 })
+
+LOAD_TOOLS_DESCRIPTION = (
+    "Load one or more tools by exact name from the tool catalog in the system "
+    "prompt so you can call them for real. The catalog lists every tool that "
+    "exists (name + one-line description) but only ALWAYS-AVAILABLE tools and "
+    "anything already loaded this session have a real schema you can call — "
+    "everything else must be loaded first. Loaded tools stay available for "
+    "the rest of this turn and every future message in this session. Pass "
+    "names=[\"tool_a\", \"tool_b\"] to load more than one at once."
+)
 
 # Tools that the Personal Assistant always has access to during scheduled
 # check-ins and proactive tasks, in addition to RAG-selected tools.
@@ -94,6 +109,7 @@ BUILTIN_TOOL_DESCRIPTIONS: Dict[str, str] = {
     "manage_endpoints": "Endpoint management: list, add, delete, enable, or disable model API endpoints.",
     "manage_mcp": "MCP server management: list, add, delete, reconnect servers, or list available tools.",
     "manage_webhooks": "Webhook management: list, add, delete, enable, or disable webhooks.",
+    "manage_n8n": "n8n workflow automation: list/get/create/update/delete workflows, activate/deactivate them, trigger a workflow run via its webhook path, and list/inspect executions. Requires an 'n8n' integration to already be registered (base URL + API key). Use for 'create an n8n workflow', 'list my n8n workflows', 'run/trigger the <name> workflow', 'check n8n execution status', 'activate/deactivate a workflow'. NOT for Odysseus's own cron scheduling (that's manage_tasks) — this controls the separate n8n automation server.",
     "api_call": "Call a configured API integration by name (Home Assistant, Miniflux, Gitea, Linkding, Jellyfin, RSS reader, git forge, bookmark manager, smart home, or any other registered service). Make a GET/POST/PUT/PATCH/DELETE request to the integration's endpoint path, with an optional JSON body. Use whenever the user asks to query or control one of their connected integrations/services.",
     "manage_tokens": "API token management: list, create, or delete API access tokens.",
     "manage_documents": "List, read, delete, or tidy documents in the editor panel. action='list' returns clickable rows (most-recent first) so the user can open any doc by clicking. action='read' (aka view/open/get) with document_id returns the content; supports offset=<N> + limit=<N> to page through large docs (response includes next_offset when more remains, so you can keep calling with offset=next_offset). action='delete' with document_id removes a doc (only way to delete). Use this for ANY 'show/read/list/open my documents/docs/files/notes' request — never shell or curl.",
@@ -432,6 +448,13 @@ class ToolIndex:
                    "home assistant", "homeassistant", "miniflux", "gitea",
                    "linkding", "jellyfin"}):
             {"api_call"},
+        # n8n workflow automation — distinct from manage_tasks (Odysseus's own
+        # cron). "workflow"/"workflows" alone is ambiguous enough to keep, but
+        # scoped tightly since it also matches generic pipeline talk.
+        frozenset({"n8n", "n8n workflow", "n8n workflows", "trigger workflow",
+                   "run workflow", "activate workflow", "deactivate workflow",
+                   "n8n execution", "n8n executions"}):
+            {"manage_n8n"},
         # Managing EXISTING research in the Library — open/read/find/delete.
         frozenset({"my research", "the research", "research on", "open research",
                    "read research", "find research", "delete research",
@@ -621,3 +644,57 @@ def reset_tool_index() -> None:
     global _tool_index, _last_attempt
     _tool_index = None
     _last_attempt = 0.0
+
+
+def _first_sentence(desc: str, max_len: int = 140) -> str:
+    """Trim a full BUILTIN_TOOL_DESCRIPTIONS entry down to a cheap one-liner
+    for the always-injected catalog — the full text is still what gets
+    embedded for RAG and still ships once the tool is actually loaded."""
+    period = desc.find(". ")
+    short = desc[:period + 1] if period != -1 else desc
+    if len(short) > max_len:
+        short = short[:max_len - 1].rstrip() + "…"
+    return short
+
+
+def build_tool_catalog(
+    disabled_tools: Optional[Set[str]] = None,
+    mcp_mgr=None,
+    mcp_disabled_map: Optional[Dict] = None,
+) -> str:
+    """Cheap, always-injected index of every tool that exists: name + a
+    trimmed one-line description. This is NOT a callable schema list — a
+    tool named here has no real schema until `load_tools` pulls it into
+    `_relevant_tools` (see src/agent_loop.py). Mirrors, at the tool level,
+    the same index-then-load pattern skills already use (see
+    services/memory/skills.py's published-skill index +
+    `manage_skills action=view`).
+    """
+    disabled_tools = disabled_tools or set()
+    lines = ["## Tool catalog (call load_tools with exact name(s) to use one)", ""]
+
+    lines.append("**Built-in:**")
+    for name, desc in sorted(BUILTIN_TOOL_DESCRIPTIONS.items()):
+        if name in disabled_tools:
+            continue
+        lines.append(f"- {name}: {_first_sentence(desc)}")
+
+    if mcp_mgr is not None:
+        try:
+            mcp_text = mcp_mgr.get_tool_descriptions_for_prompt(mcp_disabled_map or {})
+        except Exception:
+            mcp_text = ""
+        if mcp_text:
+            lines.append("")
+            lines.append("**MCP servers:**")
+            for line in mcp_text.strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("- ") and ":" in line:
+                    name = line[2:].split(":", 1)[0].strip()
+                    if name in disabled_tools:
+                        continue
+                lines.append(line)
+
+    return "\n".join(lines)

@@ -457,6 +457,8 @@ def setup_task_routes(task_scheduler) -> APIRouter:
             raise HTTPException(400, "Prompt is required for LLM/research tasks")
         if req.task_type == "action" and not req.action:
             raise HTTPException(400, "Action name is required for action tasks")
+        if req.task_type == "n8n_trigger" and not req.action:
+            raise HTTPException(400, "An n8n workflow is required for n8n_trigger tasks")
         # Block shell-executing action types for non-admins. action_run_local
         # uses subprocess.run(shell=True) and ssh_command / run_script run
         # arbitrary commands.
@@ -482,6 +484,17 @@ def setup_task_routes(task_scheduler) -> APIRouter:
             if req.task_type == "action":
                 from src.builtin_actions import BUILTIN_ACTION_INFO
                 name = BUILTIN_ACTION_INFO.get(req.action, req.action or "Action Task")
+            elif req.task_type == "n8n_trigger":
+                name = f"n8n: {req.action}" if req.action else "n8n Trigger Task"
+                try:
+                    from src.agent_tools.n8n_tools import _find_n8n_integration, _n8n_get_workflow_raw
+                    integ = _find_n8n_integration()
+                    if integ and req.action:
+                        wf = await _n8n_get_workflow_raw(integ, req.action)
+                        if wf.get("name"):
+                            name = f"n8n: {wf['name']}"
+                except Exception:
+                    pass
             elif req.prompt:
                 name = await _generate_task_name(req.prompt, owner=user)
             else:
@@ -1027,6 +1040,34 @@ def setup_task_routes(task_scheduler) -> APIRouter:
             for name, desc in BUILTIN_ACTION_INFO.items()
             if name not in _ADMIN_ONLY_ACTIONS or _is_admin(user)
         ]}
+
+    @router.get("/meta/n8n-workflows")
+    async def list_n8n_workflows(request: Request):
+        """List workflows from the registered n8n integration, for the task
+        dialog's n8n_trigger workflow picker. Flags which ones have a Webhook
+        trigger node (only those are actually triggerable via cron)."""
+        _owner(request)
+        from src.agent_tools.n8n_tools import _find_n8n_integration, _n8n_list_workflows_raw, _extract_webhook_path
+        import httpx as _httpx
+
+        integration = _find_n8n_integration()
+        if not integration:
+            return {"workflows": [], "error": "No n8n integration is registered"}
+
+        try:
+            data = await _n8n_list_workflows_raw(integration)
+        except (_httpx.HTTPStatusError, _httpx.RequestError) as exc:
+            return {"workflows": [], "error": f"Could not reach n8n: {exc}"}
+
+        workflows = []
+        for wf in data.get("data", []):
+            workflows.append({
+                "id": wf.get("id"),
+                "name": wf.get("name", wf.get("id")),
+                "active": bool(wf.get("active")),
+                "has_webhook": bool(_extract_webhook_path(wf)),
+            })
+        return {"workflows": workflows}
 
     @router.get("/meta/events")
     async def list_events(request: Request):

@@ -368,6 +368,20 @@ def _parse_generate_image(content: str) -> Dict:
 
 
 def _parse_manage_memory(content: str) -> Dict:
+    stripped = content.strip()
+    # Accept a JSON body too — the docs tell the model this tool uses a
+    # line-based format ("line 1 = action, rest = content"), but nearly
+    # every sibling tool advertises "Args (JSON): {...}", so models
+    # habitually send `{"action": "list"}` here. Without this, the whole
+    # JSON string got treated as a literal (unrecognized) action name.
+    if stripped.startswith("{"):
+        try:
+            parsed = json.loads(stripped)
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict) and "action" in parsed:
+            parsed["action"] = str(parsed["action"]).strip().lower()
+            return parsed
     lines = content.strip().split("\n")
     action = lines[0].strip().lower() if lines else ""
     args = {"action": action}

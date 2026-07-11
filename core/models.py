@@ -74,6 +74,7 @@ class Session:
     owner: Optional[str] = None
     is_important: bool = False
     message_count: int = 0
+    loaded_tools: Optional[List[str]] = None
 
     def __post_init__(self):
         if self.headers is None:
@@ -81,6 +82,8 @@ class Session:
         # Ensure each session gets its OWN list (not the shared dataclass default)
         if self.history is None:
             self.history = []
+        if self.loaded_tools is None:
+            self.loaded_tools = []
 
     @property
     def _history(self) -> List[ChatMessage]:
@@ -115,11 +118,18 @@ class Session:
         ``metadata.source == "slash"``; exclude them here so they never reach
         the model. Display/history-load paths use the raw ``history`` and are
         unaffected.
+
+        Messages superseded by a compaction summary carry
+        ``metadata.compacted_out == True`` (see `SessionManager.soft_compact_messages`).
+        They are skipped here too so the model doesn't see both the original
+        messages and their summary, but they are NOT removed from
+        ``self.history`` — the full transcript still renders for the user.
         """
         return [
             msg.to_dict()
             for msg in self.history
             if (msg.metadata or {}).get("source") != "slash"
+            and not (msg.metadata or {}).get("compacted_out")
         ]
 
     def get(self, key: str, default=None):

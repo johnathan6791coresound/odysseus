@@ -312,6 +312,14 @@ async def do_manage_tasks(content: str, owner: Optional[str] = None) -> Dict:
                 return {"error": "Prompt is required for llm/research tasks", "exit_code": 1}
             if task_type == "action" and not args.get("action_name"):
                 return {"error": "action_name is required for action tasks", "exit_code": 1}
+            if task_type == "n8n_trigger" and not args.get("action_name"):
+                return {"error": "action_name (the n8n workflow's ID — see manage_n8n action=list) is required for n8n_trigger tasks", "exit_code": 1}
+            if task_type == "n8n_trigger" and args.get("prompt"):
+                import json as _json
+                try:
+                    _json.loads(args["prompt"])
+                except (ValueError, TypeError):
+                    return {"error": "prompt must be a JSON string (the webhook body) for n8n_trigger tasks", "exit_code": 1}
 
             # Compute next_run for schedule triggers
             next_run = None

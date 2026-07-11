@@ -30,8 +30,17 @@ logger = logging.getLogger(__name__)
 # (?![\w-]) keeps the alternation from prefix-matching longer fence tags:
 # without it, ```python3 would match as tool "python" with content "3\n..."
 # and execute as code.
+#
+# MCP tool tags are dynamic (mcp__<server_id>__<tool_name>, server_id is a
+# runtime-assigned id) and can never appear in the static TOOL_TAGS set, so a
+# dedicated alternative branch matches them by shape instead of by name.
+# get_tool_descriptions_for_prompt() (mcp_manager.py) teaches the model to
+# call these tools via exactly this fence — without this branch the regex
+# never matches an mcp__ fence at all, so the model's call is silently
+# dropped (0 tool blocks) no matter how healthy the MCP connection is.
+_MCP_TAG_PATTERN = r"mcp__[\w.-]+__[\w.-]+"
 _TOOL_BLOCK_RE = re.compile(
-    r"```(" + "|".join(TOOL_TAGS) + r")(?![\w-])"
+    r"```(" + "|".join(TOOL_TAGS) + "|" + _MCP_TAG_PATTERN + r")(?![\w-])"
     r"[ \t]*([{\[][^\n]*?)?[ \t]*(?=\r?\n|```)\r?\n?([\s\S]*?)```",
     re.IGNORECASE,
 )
@@ -57,7 +66,12 @@ def _fenced_tool_call(m) -> Optional[Tuple[str, str]]:
     fence attributes on real languages, and {title="x"} on any tag is
     metadata, not arguments — all of those stay visible and inert.
     """
-    tag = m.group(1).lower()
+    raw_tag = m.group(1)
+    # MCP tool names are case-sensitive (e.g. getJiraIssue) and dispatched
+    # verbatim to the underlying MCP server, unlike the built-in TOOL_TAGS
+    # (already all-lowercase by convention) — lowercasing an mcp__ tag here
+    # would send a tool name the server never registered.
+    tag = raw_tag if raw_tag.lower().startswith("mcp__") else raw_tag.lower()
     inline = (m.group(2) or "").strip()
     body = (m.group(3) or "").strip()
     if not inline:
@@ -298,6 +312,8 @@ _TOOL_NAME_MAP = {
     "mcp_servers": "manage_mcp",
     "manage_webhooks": "manage_webhooks",
     "webhooks": "manage_webhooks",
+    "manage_n8n": "manage_n8n",
+    "n8n": "manage_n8n",
     "manage_tokens": "manage_tokens",
     "tokens": "manage_tokens",
     "manage_documents": "manage_documents",
@@ -725,7 +741,7 @@ def _raw_openai_tool_call_to_block(value) -> Optional[ToolBlock]:
     elif tool_type in ("manage_tasks", "manage_skills", "api_call", "manage_endpoints",
                        "manage_mcp", "manage_webhooks", "manage_tokens",
                        "manage_documents", "manage_settings", "manage_notes",
-                       "manage_research", "manage_bg_jobs"):
+                       "manage_research", "manage_bg_jobs", "manage_n8n"):
         content = json.dumps(args)
     elif tool_type in ("get_workspace", "list_models"):
         content = args.get("filter", "") if tool_type == "list_models" else ""
