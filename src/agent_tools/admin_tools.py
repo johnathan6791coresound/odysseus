@@ -628,6 +628,34 @@ async def do_manage_settings(content: str, owner: Optional[str] = None) -> Dict:
             return {"response": f"{len(shown)} settings (use get/set with a key)", "settings": shown, "exit_code": 0}
 
         elif action == "get":
+            # Read-only virtual key: report which model utility work actually
+            # lands on right now (after cost auto-routing / cascade resolution),
+            # which a plain `get utility_model` can't show when it's blank.
+            if (args.get("key", "") or "").strip().lower() in (
+                "effective utility model", "effective_utility_model",
+            ):
+                configured = (load_settings().get("utility_model") or "").strip()
+                if configured:
+                    return {"response": f"effective utility model = {configured} (configured)",
+                            "value": configured, "exit_code": 0}
+                try:
+                    from src.endpoint_resolver import resolve_endpoint
+                    url, model, _ = resolve_endpoint("utility", owner=owner)
+                except Exception as e:
+                    return {"response": f"effective utility model = unknown ({e})", "exit_code": 0}
+                u = url or ""
+                if not model:
+                    desc = "auto: none — using default_model"
+                elif "claude-cli" in u:
+                    desc = f"auto: {model} (Claude CLI subscription)"
+                elif ("localhost" in u or "127.0.0.1" in u
+                      or "host.docker.internal" in u or ":11434" in u
+                      or ":1234" in u or ":8080" in u):
+                    desc = f"auto: {model} (local, free)"
+                else:
+                    desc = f"auto: {model} (api)"
+                return {"response": f"effective utility model = {desc}",
+                        "value": desc, "exit_code": 0}
             key = _resolve(args.get("key", ""))
             if not key:
                 return {"error": "key is required", "exit_code": 1}

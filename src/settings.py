@@ -154,6 +154,23 @@ DEFAULT_SETTINGS = {
     # Ordered fallback chain for the Utility model (summarization, naming,
     # tidy actions, etc.).
     "utility_model_fallbacks": [],
+    # ── Cost auto-routing ──
+    # Master switch. When True, unset utility/research/task roles auto-route to
+    # the cheapest currently-available model (free local, else a cheap API
+    # model) instead of silently billing the expensive default chat model for
+    # background work — and the agent gets a prompt bullet nudging it to
+    # delegate simple sub-tasks to the `utility` role. When False the entire
+    # feature is off: utility/research/task cascade to default_model as before,
+    # and the delegation bullet is omitted.
+    "cost_auto_routing_enabled": True,
+    # Sub-toggle (only consulted when the master is on): disable just the
+    # auto-cheap-utility-model piece, keeping utility calls on the configured
+    # utility_model/default_model while leaving the rest of cost-routing on.
+    "utility_auto_cheap_enabled": True,
+    # Sub-toggle (only consulted when both of the above are on): prefer a live
+    # local (free) model for utility calls. Off → skip straight to the cheap
+    # API model branch. Useful escape hatch when local inference is slow.
+    "utility_prefer_local_enabled": True,
     "teacher_model": "",
     "teacher_enabled": False,
     "teacher_tier2_enabled": False,
@@ -275,6 +292,8 @@ _PER_USER_KEYS = {
     "default_endpoint_id", "default_model", "default_model_fallbacks",
     "utility_endpoint_id", "utility_model", "utility_model_fallbacks",
     "research_endpoint_id", "research_model",
+    "cost_auto_routing_enabled", "utility_auto_cheap_enabled",
+    "utility_prefer_local_enabled",
 }
 
 

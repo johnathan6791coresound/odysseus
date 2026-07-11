@@ -6,6 +6,7 @@ Consolidates the 4+ copies of normalize_base / resolve_endpoint logic into one p
 
 import json
 import logging
+import os
 import socket
 import subprocess
 from typing import Optional, Tuple, Dict
@@ -345,6 +346,39 @@ def resolve_endpoint(
     # when the user is mid-conversation with a different model.
     if not ep_id and fallback_url and fallback_model:
         return fallback_url, fallback_model, fallback_headers
+
+    # Cost auto-routing: an unset utility role (reached directly, or transitively
+    # via the research/task cascade above) prefers the cheapest currently-live
+    # model — free local, else a cheap API model — instead of silently billing
+    # the expensive default chat model for background work. Gated behind a master
+    # toggle plus a utility-specific sub-toggle; both default on. A discovered
+    # local model has no ModelEndpoint DB row, so this builds the chat url /
+    # headers directly rather than going through the DB lookup below.
+    if not ep_id and setting_prefix in ("utility", "research", "task"):
+        master_on = get_user_setting(
+            "cost_auto_routing_enabled", owner_str,
+            settings.get("cost_auto_routing_enabled", True),
+        )
+        sub_on = get_user_setting(
+            "utility_auto_cheap_enabled", owner_str,
+            settings.get("utility_auto_cheap_enabled", True),
+        )
+        if master_on and sub_on:
+            from src.model_discovery import resolve_cheapest_available_model
+            cheap = resolve_cheapest_available_model(owner=owner)
+            if cheap:
+                base_url, cheap_model = cheap
+                provider = _detect_provider(base_url)
+                api_key = None
+                if provider == "openai":
+                    api_key = os.getenv("OPENAI_API_KEY")
+                elif provider == "anthropic":
+                    api_key = os.getenv("ANTHROPIC_API_KEY")
+                logger.info(
+                    "[resolve_endpoint] cost auto-routing %s -> cheap model %s (%s)",
+                    setting_prefix, cheap_model, base_url,
+                )
+                return build_chat_url(base_url), cheap_model, build_headers(api_key, base_url)
 
     # Unset Utility (or anything else that didn't have a fallback) means "same as Default Chat Model".
     if not ep_id:

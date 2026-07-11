@@ -288,3 +288,123 @@ class ModelDiscovery:
             )
 
         return {"providers": providers}
+
+
+# ── Cheapest-available-model resolver (cost auto-routing) ───────────────────
+#
+# Used by endpoint_resolver.resolve_endpoint() to pick a free local model (or a
+# cheap API model) for unset utility/research/task roles instead of silently
+# billing the expensive default chat model for background work.
+
+# Full-scan cache: the module-level _hosts_cache above only memoizes the host
+# list, not the per-port /v1/models scan, so we add a dedicated short TTL cache
+# for the resolved cheap endpoint.
+_cheap_model_cache: Optional[tuple] = None  # (expires_at, result)
+_CHEAP_MODEL_CACHE_TTL = 60  # seconds
+
+# Process-level failure latch (mirrors embeddings._http_embed_down). When a
+# local utility call fails/cancels we skip local for a short window so utility
+# calls don't repeatedly stall on a slow/contended local model. Reset on the
+# next successful local call.
+_local_utility_cooldown_until: float = 0.0
+_LOCAL_UTILITY_COOLDOWN = 300  # seconds (5 min)
+
+# Small hardcoded list of cheap hosted models, tried only when no live local
+# endpoint is available. Each entry maps a model id to the env var that must be
+# present for its provider to be considered configured.
+# Each entry is (base_url, model, env_var). base_url is a provider *base* (not a
+# full chat/completions URL) so endpoint_resolver.build_chat_url() can derive
+# the correct per-provider path.
+_KNOWN_CHEAP_API_MODELS = [
+    ("https://api.anthropic.com", "claude-haiku-4-5", "ANTHROPIC_API_KEY"),
+    ("https://api.openai.com/v1", "gpt-4o-mini", "OPENAI_API_KEY"),
+]
+
+
+def note_local_utility_failure() -> None:
+    """Trip the cooldown latch after a failed/cancelled local utility call."""
+    global _local_utility_cooldown_until
+    _local_utility_cooldown_until = time.time() + _LOCAL_UTILITY_COOLDOWN
+    logger.info("Local utility model tripped cooldown latch for %ss", _LOCAL_UTILITY_COOLDOWN)
+
+
+def note_local_utility_success() -> None:
+    """Clear the cooldown latch after a successful local utility call."""
+    global _local_utility_cooldown_until
+    _local_utility_cooldown_until = 0.0
+
+
+def _local_utility_in_cooldown() -> bool:
+    return time.time() < _local_utility_cooldown_until
+
+
+def _cheap_api_model() -> Optional[tuple]:
+    """First known cheap hosted model whose provider is configured, else None."""
+    for base_url, model, env_var in _KNOWN_CHEAP_API_MODELS:
+        if os.getenv(env_var):
+            return (base_url, model)
+    return None
+
+
+def resolve_cheapest_available_model(owner: Optional[str] = None) -> Optional[tuple]:
+    """Resolve the cheapest currently-usable (base_url, model) for utility work.
+
+    Preference order:
+      1. A live local model server (free) — unless the user disabled
+         ``utility_prefer_local_enabled`` or the cooldown latch is tripped.
+      2. A cheap hosted model whose provider key is configured.
+      3. None — caller falls through to existing default_model behavior.
+
+    Only endpoints currently answering ``/v1/models`` are returned for the local
+    branch, so a merely-installed-but-unloaded model that needs a slow cold load
+    is never picked. Wrapped in a 60s TTL cache to avoid re-scanning ports on
+    every background call.
+    """
+    global _cheap_model_cache
+    now = time.time()
+    if _cheap_model_cache and now < _cheap_model_cache[0]:
+        return _cheap_model_cache[1]
+
+    result: Optional[tuple] = None
+
+    prefer_local = True
+    try:
+        from src.settings import get_user_setting
+        prefer_local = bool(get_user_setting(
+            "utility_prefer_local_enabled", owner or "", True
+        ))
+    except Exception:
+        pass
+
+    if prefer_local and not _local_utility_in_cooldown():
+        try:
+            from src.constants import DEFAULT_HOST, OPENAI_API_KEY
+            discovery = ModelDiscovery(DEFAULT_HOST, OPENAI_API_KEY).discover_models()
+            items = discovery.get("items") or []
+            if items:
+                first = items[0]
+                # discover_models yields a full .../v1/chat/completions url;
+                # hand back the base so build_chat_url can re-derive the path.
+                full_url = first.get("url") or ""
+                base_url = full_url.replace("/chat/completions", "")
+                models = first.get("models") or []
+                # Prefer a chat model over embeddings/tts in the list.
+                model = None
+                for m in models:
+                    if m and not any(p in str(m).lower() for p in (
+                        "embedding", "tts", "whisper", "rerank"
+                    )):
+                        model = m
+                        break
+                if not model and models:
+                    model = models[0]
+                if base_url and model:
+                    result = (base_url, model)
+        except Exception as e:
+            logger.warning("resolve_cheapest_available_model local scan failed: %s", e)
+
+    if result is None:
+        result = _cheap_api_model()
+
+    _cheap_model_cache = (now + _CHEAP_MODEL_CACHE_TTL, result)
+    return result
