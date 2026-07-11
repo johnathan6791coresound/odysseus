@@ -252,6 +252,7 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
         db = SessionLocal()
         try:
             folder_map = {}
+            project_map = {}
             token_map = {}
             important_map = {}
             created_map = {}
@@ -259,11 +260,12 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
             last_msg_map = {}
             mode_map = {}
             msg_count_map = {}
-            q = db.query(DbSession.id, DbSession.folder, DbSession.total_input_tokens, DbSession.total_output_tokens, DbSession.is_important, DbSession.created_at, DbSession.updated_at, DbSession.last_message_at, DbSession.mode, DbSession.message_count).filter(DbSession.archived == False)
+            q = db.query(DbSession.id, DbSession.folder, DbSession.project_id, DbSession.total_input_tokens, DbSession.total_output_tokens, DbSession.is_important, DbSession.created_at, DbSession.updated_at, DbSession.last_message_at, DbSession.mode, DbSession.message_count).filter(DbSession.archived == False)
             q = owner_filter(q, DbSession, user)
             rows = q.all()
             for row in rows:
                 folder_map[row.id] = row.folder
+                project_map[row.id] = row.project_id
                 token_map[row.id] = (row.total_input_tokens or 0) + (row.total_output_tokens or 0)
                 important_map[row.id] = row.is_important or False
                 created_map[row.id] = row.created_at.isoformat() if row.created_at else None
@@ -301,6 +303,7 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
         sessions = [{"id": s.id, "name": s.name, "model": _public_model(s.name, s.model),
                      "endpoint_url": s.endpoint_url, "rag": s.rag,
                      "archived": s.archived, "folder": folder_map.get(s.id),
+                     "project_id": project_map.get(s.id),
                      "total_tokens": token_map.get(s.id, 0),
                      "is_important": important_map.get(s.id, False),
                      "created_at": created_map.get(s.id),
@@ -453,7 +456,7 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
         request: Request, sid: str,
         name: str = Form(None), folder: str = Form(None),
         model: str = Form(None), endpoint_url: str = Form(None),
-        endpoint_id: str = Form(None),
+        endpoint_id: str = Form(None), project_id: str = Form(None),
     ):
         _verify_session_owner(request, sid)
         try:
@@ -476,6 +479,38 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
                     result["folder"] = folder if folder else None
             finally:
                 db.close()
+        # Update project membership (Projects feature). Empty string clears it;
+        # a non-empty value must reference a project the user owns.
+        if project_id is not None:
+            from core.database import Project as DbProject
+            user = effective_user(request)
+            new_pid = project_id or None
+            if new_pid is not None:
+                pdb = SessionLocal()
+                try:
+                    pq = owner_filter(
+                        pdb.query(DbProject).filter(DbProject.id == new_pid),
+                        DbProject, user)
+                    if pq.first() is None:
+                        raise HTTPException(404, "Project not found")
+                finally:
+                    pdb.close()
+            db = SessionLocal()
+            try:
+                db_session = db.query(DbSession).filter(DbSession.id == sid).first()
+                if db_session:
+                    db_session.project_id = new_pid
+                    db_session.updated_at = utcnow_naive()
+                    db.commit()
+                    result["project_id"] = new_pid
+            finally:
+                db.close()
+            # Keep the cached in-memory session current — Phase 2's injection
+            # seam reads session.project_id directly.
+            try:
+                session.project_id = new_pid
+            except Exception:
+                pass
         # Switch model/endpoint mid-session
         if model is not None and endpoint_url is not None:
             user = effective_user(request)

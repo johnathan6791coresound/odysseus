@@ -72,6 +72,7 @@ class Session:
     headers: Optional[Dict[str, str]] = None
     history: List[ChatMessage] = None
     owner: Optional[str] = None
+    project_id: Optional[str] = None  # Projects feature — grouping membership; read at the injection seam
     is_important: bool = False
     message_count: int = 0
     loaded_tools: Optional[List[str]] = None
