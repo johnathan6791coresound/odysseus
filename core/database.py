@@ -3,7 +3,7 @@ import logging
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from sqlalchemy import event, create_engine, Column, String, Text, Boolean, DateTime, Integer, ForeignKey, JSON, Index, func, text
+from sqlalchemy import event, create_engine, Column, String, Text, Boolean, DateTime, Integer, ForeignKey, JSON, Index, func, text, Float as sa_Float
 from sqlalchemy.engine import Engine
 from sqlalchemy.types import TypeDecorator
 from sqlalchemy.ext.declarative import declarative_base, declared_attr
@@ -125,7 +125,13 @@ class Session(TimestampMixin, Base):
     
     # Headers stored as JSON
     headers = Column(JSON, default=dict)
-    
+
+    # Tool names explicitly loaded via the `load_tools` meta-tool this
+    # session — carried forward on every later message so a tool loaded
+    # once doesn't need reloading. See src/tool_index.py:build_tool_catalog
+    # and the tool-selection block in src/agent_loop.py.
+    loaded_tools = Column(JSON, default=list)
+
     # Timestamps are provided by TimestampMixin
     last_accessed = Column(DateTime, default=func.now(), onupdate=func.now())
     # Timestamp of the last actual MESSAGE in this session. Set explicitly
@@ -178,6 +184,99 @@ class Session(TimestampMixin, Base):
             'total_output_tokens': self.total_output_tokens or 0,
             'crew_member_id': self.crew_member_id,
         }
+
+
+class UsageEvent(Base):
+    """Per-LLM-call token/cost record for the Usage & Cost dashboard.
+
+    One row per completed provider call (main chat, utility, research, task,
+    vision, teacher, chat_with_model, pipeline step). ``session_id`` is nullable
+    because some calls (scheduled tasks, background jobs) have no chat session.
+    ``cost_cents`` is nullable — left NULL when no ModelPricing match exists
+    rather than guessing.
+    """
+    __tablename__ = "usage_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # No hard FK: keeping it soft avoids cascade-delete wiping historical cost
+    # data when a session is deleted, and lets non-session calls store NULL.
+    session_id = Column(String, nullable=True, index=True)
+    owner = Column(String, nullable=True, index=True)
+    role = Column(String, nullable=True, index=True)  # default/utility/research/task/vision/teacher
+    provider = Column(String, nullable=True)
+    model = Column(String, nullable=True, index=True)
+    input_tokens = Column(Integer, default=0)
+    output_tokens = Column(Integer, default=0)
+    cache_read_tokens = Column(Integer, default=0)
+    cache_write_tokens = Column(Integer, default=0)
+    cost_cents = Column(sa_Float, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive, index=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'session_id': self.session_id,
+            'owner': self.owner,
+            'role': self.role,
+            'provider': self.provider,
+            'model': self.model,
+            'input_tokens': self.input_tokens or 0,
+            'output_tokens': self.output_tokens or 0,
+            'cache_read_tokens': self.cache_read_tokens or 0,
+            'cache_write_tokens': self.cache_write_tokens or 0,
+            'cost_cents': self.cost_cents,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class ModelPricing(Base):
+    """Per-model pricing, keyed by a model-id substring pattern.
+
+    Mirrors the KNOWN_CONTEXT_WINDOWS fallback-table pattern in
+    src/model_context.py: ``model`` is matched as a case-insensitive substring
+    of the actual model id, so ``claude-haiku`` covers ``claude-haiku-4-5``,
+    dated snapshots, etc. Seeded from KNOWN_MODEL_PRICING; admin-editable.
+    """
+    __tablename__ = "model_pricing"
+
+    model = Column(String, primary_key=True)  # substring pattern
+    input_price_per_million = Column(sa_Float, nullable=True)
+    output_price_per_million = Column(sa_Float, nullable=True)
+    cache_read_price_per_million = Column(sa_Float, nullable=True)
+
+    def to_dict(self):
+        return {
+            'model': self.model,
+            'input_price_per_million': self.input_price_per_million,
+            'output_price_per_million': self.output_price_per_million,
+            'cache_read_price_per_million': self.cache_read_price_per_million,
+        }
+
+
+# Seed pricing (USD per million tokens). Substring-matched against model ids.
+# Prices are approximate list prices; admin-editable via the pricing table for
+# corrections. cache_read is the discounted cached-input rate where published.
+KNOWN_MODEL_PRICING = {
+    # Anthropic. Bare "haiku"/"sonnet"/"opus" patterns cover the Claude Code CLI
+    # (claude-cli provider), which reports its model as just "haiku"/"sonnet" —
+    # not "claude-haiku". A longer, more specific pattern (e.g. "claude-sonnet")
+    # still wins for full API model ids because the lookup prefers the longest
+    # matching pattern.
+    "haiku": (0.80, 4.00, 0.08),
+    "sonnet": (3.00, 15.00, 0.30),
+    "opus": (15.00, 75.00, 1.50),
+    "claude-haiku": (0.80, 4.00, 0.08),
+    "claude-3-5-haiku": (0.80, 4.00, 0.08),
+    "claude-sonnet": (3.00, 15.00, 0.30),
+    "claude-3-5-sonnet": (3.00, 15.00, 0.30),
+    "claude-opus": (15.00, 75.00, 1.50),
+    # OpenAI
+    "gpt-4o-mini": (0.15, 0.60, 0.075),
+    "gpt-4o": (2.50, 10.00, 1.25),
+    "gpt-4.1-mini": (0.40, 1.60, 0.10),
+    "gpt-4.1": (2.00, 8.00, 0.50),
+}
+
 
 class ChatMessage(Base):
     """
@@ -370,6 +469,10 @@ class ModelEndpoint(TimestampMixin, Base):
     hidden_models = Column(Text, nullable=True)    # JSON list of model IDs that failed probing
     cached_models = Column(Text, nullable=True)    # JSON list of last-known model IDs (avoids probe on list)
     pinned_models = Column(Text, nullable=True)    # JSON list of admin-pinned model IDs (manual, may not appear in /v1/models)
+    # JSON dict {model_id: context_length_int} — per-model context window override.
+    # When set for a model, get_context_length() returns this instead of the
+    # auto-detected window, so it reaches Ollama as num_ctx (the KV-cache size).
+    model_context_overrides = Column(Text, nullable=True)
     model_type = Column(String, nullable=True, default="llm")  # "llm" or "image"
     # auto = classify by URL; local = self-hosted server; api/proxy = external
     # OpenAI-compatible API even when reachable through a private/tailnet IP.
@@ -423,6 +526,73 @@ class McpServer(TimestampMixin, Base):
     oauth_config = Column(Text, nullable=True)   # JSON: provider, keys_file, token_file, scopes
     disabled_tools = Column(Text, nullable=True)  # JSON array of tool names to hide from LLM
     oauth_tokens = Column(EncryptedText, nullable=True)  # JSON {tokens, client_info} for generic MCP OAuth, encrypted at rest
+
+
+class CliIntegration(TimestampMixin, Base):
+    """Admin-configured CLI credentials so agent-run shell commands (the
+    `bash` tool) can authenticate against external services without any
+    MCP/OAuth round-trip. `kind` selects which fields apply:
+      - "git_ssh": host/port/ssh_user/key_filename/public_key/fingerprint
+        (an ed25519 keypair the admin adds to the git host's account)
+      - "aws_cli": aws_access_key_id/aws_secret_access_key/aws_region,
+        written into a named profile in ~/.aws/credentials + ~/.aws/config
+    See routes/cli_integration_routes.py."""
+    __tablename__ = "cli_integrations"
+
+    id = Column(String, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    kind = Column(String, nullable=False, default="git_ssh")  # "git_ssh" | "aws_cli"
+
+    # git_ssh fields
+    host = Column(String, nullable=True)
+    port = Column(Integer, nullable=True, default=22)
+    ssh_user = Column(String, nullable=True, default="git")
+    key_filename = Column(String, nullable=True)   # basename under ~/.ssh/keys/
+    public_key = Column(Text, nullable=True)
+    fingerprint = Column(String, nullable=True)
+
+    # aws_cli fields — access key/secret encrypted at rest, same pattern as
+    # McpServer.oauth_tokens
+    aws_access_key_id = Column(EncryptedText, nullable=True)
+    aws_secret_access_key = Column(EncryptedText, nullable=True)
+    aws_region = Column(String, nullable=True)
+
+    is_enabled = Column(Boolean, default=True)
+    last_test_status = Column(String, nullable=True)   # "ok" | "error" | None
+    last_test_output = Column(Text, nullable=True)
+    last_test_at = Column(DateTime, nullable=True)
+
+
+class SshConnection(TimestampMixin, Base):
+    """Admin-configured generic SSH host connections (not git-specific) so
+    the agent can `ssh <host>` via the `bash` tool to run commands on a
+    remote box. Same per-row-keypair model as CliIntegration's git_ssh kind,
+    kept as a separate table/section per user request so git remotes and
+    plain server access are managed in distinct UI sections. Both write into
+    the same ~/.ssh/config — see src/ssh_manager.py.regenerate_ssh_config.
+
+    auth_method="key" (default): key_filename/public_key/fingerprint as usual.
+    auth_method="password": password is encrypted at rest and also written to
+    a chmod-600 file under ~/.ssh/passwords/ so the agent can run
+    `sshpass -f ~/.ssh/passwords/<id> ssh <host>` without the password ever
+    appearing in a shell command's argv (visible via `ps`) or agent transcript."""
+    __tablename__ = "ssh_connections"
+
+    id = Column(String, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    host = Column(String, nullable=False)
+    port = Column(Integer, nullable=False, default=22)
+    ssh_user = Column(String, nullable=False, default="root")
+    auth_method = Column(String, nullable=False, default="key")  # "key" | "password"
+    key_filename = Column(String, nullable=True)
+    public_key = Column(Text, nullable=True)
+    fingerprint = Column(String, nullable=True)
+    password = Column(EncryptedText, nullable=True)
+    note = Column(Text, nullable=True)
+    is_enabled = Column(Boolean, default=True)
+    last_test_status = Column(String, nullable=True)
+    last_test_output = Column(Text, nullable=True)
+    last_test_at = Column(DateTime, nullable=True)
 
 
 class Comparison(TimestampMixin, Base):
@@ -499,6 +669,58 @@ class Webhook(TimestampMixin, Base):
     last_triggered_at = Column(DateTime, nullable=True)
     last_status_code = Column(Integer, nullable=True)
     last_error = Column(String, nullable=True)
+
+
+class TelegramConfig(TimestampMixin, Base):
+    """One row per Telegram bot the admin has registered.
+
+    bot_token is encrypted at rest, same pattern as ModelEndpoint.api_key.
+    last_update_id tracks the long-poll cursor so a process restart doesn't
+    re-deliver already-handled updates back to getUpdates. At most one row
+    may have is_notifier=True — that's the bot scheduled-task notifications
+    go through; enforced in routes/telegram_routes.py, not at the DB level.
+    """
+    __tablename__ = "telegram_config"
+
+    id = Column(String, primary_key=True, index=True)
+    name = Column(String, nullable=False, default="Telegram Bot")
+    bot_token = Column(EncryptedText, nullable=True)
+    enabled = Column(Boolean, default=False)
+    is_notifier = Column(Boolean, default=False)
+    last_update_id = Column(Integer, nullable=True, default=None)
+
+
+class TelegramLink(TimestampMixin, Base):
+    """Links one (bot, Telegram chat) pair to an Odysseus user + an active
+    session. A Telegram user's chat_id is the same across every bot they
+    talk to, so bot_id is part of the identity, not just chat_id — the same
+    person can link bot A to one session and bot B to a different one.
+
+    A row starts unlinked (owner=None) with a short-lived `link_code` shown
+    in the Odysseus UI; the user sends `/start <link_code>` to the specific
+    bot named on that link to claim it. `api_token_id` points at an
+    ApiToken (scope=chat) created for this link so message delivery reuses
+    the existing token-authenticated /api/v1/chat path instead of a new
+    privilege model.
+    """
+    __tablename__ = "telegram_links"
+
+    id = Column(String, primary_key=True, index=True)
+    bot_id = Column(String, ForeignKey("telegram_config.id", ondelete="CASCADE"), nullable=True, index=True)
+    chat_id = Column(String, nullable=False, index=True)
+    owner = Column(String, nullable=True, index=True)
+    link_code = Column(String, nullable=True, index=True)
+    api_token_id = Column(String, ForeignKey("api_tokens.id", ondelete="SET NULL"), nullable=True)
+    # Raw "ody_..." bearer value for api_token_id, encrypted at rest. Needed
+    # because ApiToken only stores a bcrypt hash (one-way) — the bot must
+    # present the original bearer token on every /api/v1/chat call, so a copy
+    # is kept here the same way ModelEndpoint.api_key keeps provider keys.
+    token_encrypted = Column(EncryptedText, nullable=True)
+    active_session_id = Column(String, ForeignKey("sessions.id", ondelete="SET NULL"), nullable=True)
+    is_active = Column(Boolean, default=True)
+
+    bot = relationship("TelegramConfig", backref=backref("links", cascade="all, delete-orphan"))
+    session = relationship("Session", backref=backref("telegram_links"))
 
 
 class UserTool(TimestampMixin, Base):
@@ -822,6 +1044,50 @@ def _migrate_model_endpoints():
         except Exception:
             pass
 
+def _migrate_drop_telegram_links_legacy_unique():
+    """Drop telegram_links if it still has the original single-bot schema
+    (chat_id UNIQUE, no bot_id). That constraint assumed one bot per
+    instance — a Telegram chat_id is the same across every bot a user talks
+    to, so once multiple bots are supported it must be unique per (bot_id,
+    chat_id) instead, not globally. SQLite can't drop a column-level UNIQUE
+    via ALTER, so the table is dropped and create_all() recreates it with
+    the current (unconstrained) schema right after this runs. Safe: the
+    table is new and this only fires once, before real link data piles up.
+    """
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(telegram_links)").fetchall()]
+        if not columns:
+            return  # table doesn't exist yet — nothing to migrate
+        if "bot_id" in columns:
+            return  # already on the multi-bot schema
+        indexes = conn.execute("PRAGMA index_list(telegram_links)").fetchall()
+        for idx in indexes:
+            idx_name, is_unique = idx[1], idx[2]
+            if not is_unique:
+                continue
+            idx_cols = [r[2] for r in conn.execute(f"PRAGMA index_info({idx_name})").fetchall()]
+            if idx_cols == ["chat_id"]:
+                conn.execute("DROP TABLE IF EXISTS telegram_links")
+                conn.commit()
+                logging.getLogger(__name__).info(
+                    "Migrated: dropped legacy telegram_links table (single-bot unique chat_id → multi-bot schema)"
+                )
+                return
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"telegram_links legacy-schema check failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _migrate_add_hidden_models_column():
     """Add hidden_models column to model_endpoints if it doesn't exist."""
     import sqlite3
@@ -1045,6 +1311,29 @@ def _migrate_add_pinned_models_column():
         except Exception:
             pass
 
+def _migrate_add_model_context_overrides_column():
+    """Add model_context_overrides column to model_endpoints if it doesn't exist."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute("PRAGMA table_info(model_endpoints)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if columns and "model_context_overrides" not in columns:
+            conn.execute("ALTER TABLE model_endpoints ADD COLUMN model_context_overrides TEXT")
+            conn.commit()
+            logging.getLogger(__name__).info("Migrated: added 'model_context_overrides' column to model_endpoints")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"model_context_overrides migration failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 def _migrate_add_notes_sort_order():
     """Add sort_order, image_url, repeat columns to notes if they don't exist."""
     import sqlite3
@@ -1146,6 +1435,159 @@ def _migrate_add_token_columns():
             conn.close()
         except Exception:
             pass
+
+def _migrate_create_usage_events_table():
+    """Create the usage_events table if missing (idempotent).
+
+    Base.metadata.create_all() already creates missing tables, so this is
+    belt-and-suspenders for the manual-migration chain and keeps schema
+    ownership co-located with the other _migrate_* helpers.
+    """
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS usage_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                owner TEXT,
+                role TEXT,
+                provider TEXT,
+                model TEXT,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                cache_read_tokens INTEGER DEFAULT 0,
+                cache_write_tokens INTEGER DEFAULT 0,
+                cost_cents REAL,
+                created_at TIMESTAMP
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_usage_events_session_id ON usage_events(session_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_usage_events_role ON usage_events(role)")
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_usage_events_model ON usage_events(model)")
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_usage_events_created_at ON usage_events(created_at)")
+        conn.commit()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"usage_events table migration failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _migrate_create_model_pricing_table():
+    """Create model_pricing if missing and seed KNOWN_MODEL_PRICING rows.
+
+    Only inserts a seed row when its pattern isn't already present, so admin
+    edits/corrections are never overwritten on later startups.
+    """
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_pricing (
+                model TEXT PRIMARY KEY,
+                input_price_per_million REAL,
+                output_price_per_million REAL,
+                cache_read_price_per_million REAL
+            )
+            """
+        )
+        existing = {row[0] for row in conn.execute("SELECT model FROM model_pricing").fetchall()}
+        for pattern, (inp, out, cache) in KNOWN_MODEL_PRICING.items():
+            if pattern not in existing:
+                conn.execute(
+                    "INSERT INTO model_pricing (model, input_price_per_million, "
+                    "output_price_per_million, cache_read_price_per_million) VALUES (?, ?, ?, ?)",
+                    (pattern, inp, out, cache),
+                )
+        conn.commit()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"model_pricing table migration failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _migrate_backfill_usage_cost():
+    """Fill cost_cents for usage_events rows left NULL because no pricing matched
+    at record time (e.g. seeded before the bare haiku/sonnet patterns existed).
+
+    Idempotent: only touches rows where cost_cents IS NULL. Rows for a genuinely
+    unpriced model stay NULL and are simply re-checked (cheaply) next startup.
+    """
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(usage_events)").fetchall()]
+        if not cols:
+            return
+        pricing = conn.execute(
+            "SELECT model, input_price_per_million, output_price_per_million, "
+            "cache_read_price_per_million FROM model_pricing"
+        ).fetchall()
+
+        def _price_for(model):
+            ml = (model or "").lower()
+            best = None
+            for pat, ip, op, cp in pricing:
+                p = (pat or "").lower()
+                if p and p in ml and (best is None or len(p) > len(best[0])):
+                    best = (p, ip, op, cp)
+            return best
+
+        rows = conn.execute(
+            "SELECT id, provider, model, input_tokens, output_tokens, cache_read_tokens "
+            "FROM usage_events WHERE cost_cents IS NULL"
+        ).fetchall()
+        updated = 0
+        for rid, provider, model, inp, out, cread in rows:
+            pr = _price_for(model)
+            if not pr:
+                continue
+            _, ip, op, cp = pr
+            if ip is None or op is None:
+                continue
+            cache_rate = cp if cp is not None else ip
+            if provider in ("anthropic", "claude-cli"):
+                fresh_input = inp or 0
+            else:
+                fresh_input = max(0, (inp or 0) - (cread or 0))
+            dollars = (fresh_input * ip + (cread or 0) * cache_rate
+                       + (out or 0) * op) / 1_000_000.0
+            conn.execute("UPDATE usage_events SET cost_cents = ? WHERE id = ?",
+                         (round(dollars * 100.0, 6), rid))
+            updated += 1
+        if updated:
+            conn.commit()
+            logging.getLogger(__name__).info(
+                "Backfilled cost_cents for %s usage_events rows", updated)
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"usage cost backfill failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 
 def _migrate_add_owner_to_table(table_name: str, index_name: str):
     """Generic helper: add owner TEXT column + index to a table if missing."""
@@ -1521,6 +1963,57 @@ def _migrate_add_disabled_tools():
     except Exception as e:
         logging.getLogger(__name__).warning(f"disabled_tools migration: {e}")
 
+def _migrate_add_cli_integration_aws_columns():
+    """Add the aws_cli-kind columns to cli_integrations if missing. The
+    original NOT NULL git_ssh columns (host/port/ssh_user/key_filename) are
+    left as-is — aws_cli rows satisfy them with empty-string/0 sentinels
+    (see routes/cli_integration_routes.py) rather than requiring a SQLite
+    table rebuild just to relax those constraints."""
+    try:
+        with engine.connect() as conn:
+            cols = [r[1] for r in conn.execute(text("PRAGMA table_info(cli_integrations)"))]
+            for col, ddl_type in (
+                ("aws_access_key_id", "TEXT"),
+                ("aws_secret_access_key", "TEXT"),
+                ("aws_region", "TEXT"),
+            ):
+                if col not in cols:
+                    conn.execute(text(f"ALTER TABLE cli_integrations ADD COLUMN {col} {ddl_type}"))
+            conn.commit()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"cli_integrations aws columns migration: {e}")
+
+
+def _migrate_add_ssh_connection_password_columns():
+    """Add auth_method/password columns to ssh_connections if missing.
+    key_filename stays NOT NULL at the SQLite level (as originally created);
+    password-auth rows satisfy it with an empty-string sentinel, same
+    pattern as CliIntegration's aws_cli rows — see
+    routes/ssh_connection_routes.py."""
+    try:
+        with engine.connect() as conn:
+            cols = [r[1] for r in conn.execute(text("PRAGMA table_info(ssh_connections)"))]
+            if "auth_method" not in cols:
+                conn.execute(text("ALTER TABLE ssh_connections ADD COLUMN auth_method TEXT DEFAULT 'key'"))
+            if "password" not in cols:
+                conn.execute(text("ALTER TABLE ssh_connections ADD COLUMN password TEXT"))
+            conn.commit()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"ssh_connections password columns migration: {e}")
+
+
+def _migrate_add_loaded_tools_column():
+    """Add loaded_tools column to sessions table if missing."""
+    try:
+        with engine.connect() as conn:
+            cols = [r[1] for r in conn.execute(text("PRAGMA table_info(sessions)"))]
+            if "loaded_tools" not in cols:
+                conn.execute(text("ALTER TABLE sessions ADD COLUMN loaded_tools TEXT"))
+                conn.commit()
+                logging.getLogger(__name__).info("Added loaded_tools column to sessions")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"loaded_tools migration: {e}")
+
 def _migrate_add_mcp_oauth_tokens_column():
     """Add oauth_tokens column to mcp_servers table if missing.
 
@@ -1818,10 +2311,12 @@ def init_db():
     Should be called when starting the application.
     """
     _migrate_model_endpoints()
+    _migrate_drop_telegram_links_legacy_unique()
     Base.metadata.create_all(bind=engine)
     _migrate_add_hidden_models_column()
     _migrate_add_cached_models_column()
     _migrate_add_pinned_models_column()
+    _migrate_add_model_context_overrides_column()
     _migrate_add_notes_sort_order()
     _migrate_add_model_type_column()
     _migrate_add_model_endpoint_refresh_columns()
@@ -1846,6 +2341,9 @@ def init_db():
     _migrate_add_email_oauth_columns()
     _migrate_add_task_automation_columns()
     _migrate_add_disabled_tools()
+    _migrate_add_cli_integration_aws_columns()
+    _migrate_add_ssh_connection_password_columns()
+    _migrate_add_loaded_tools_column()
     _migrate_add_mcp_oauth_tokens_column()
     _migrate_add_task_v2_columns()
     _migrate_add_notifications_enabled()
@@ -1865,6 +2363,79 @@ def init_db():
     _migrate_encrypt_signatures()
     _migrate_encrypt_endpoint_keys()
     _migrate_backfill_task_folders()
+    _migrate_add_telegram_token_encrypted_column()
+    _migrate_add_telegram_config_multi_bot_columns()
+    _migrate_create_usage_events_table()
+    _migrate_create_model_pricing_table()
+    _migrate_backfill_usage_cost()
+
+
+def _migrate_add_telegram_token_encrypted_column():
+    """Add token_encrypted to telegram_links if missing.
+
+    telegram_links was created by an earlier `create_all()` before this
+    column existed; create_all() only creates missing tables, never adds
+    columns to ones that already exist, so a plain ALTER is needed here.
+    """
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(telegram_links)").fetchall()]
+        if columns and "token_encrypted" not in columns:
+            conn.execute("ALTER TABLE telegram_links ADD COLUMN token_encrypted TEXT")
+            conn.commit()
+            logging.getLogger(__name__).info("Migrated: added 'token_encrypted' column to telegram_links")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"telegram_links.token_encrypted migration failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _migrate_add_telegram_config_multi_bot_columns():
+    """Add name/is_notifier to telegram_config for multi-bot support.
+
+    telegram_config was created by an earlier create_all() before these
+    columns existed; create_all() only creates missing tables, so a plain
+    ALTER is needed. Existing (single) bot row is named + left as the
+    notifier so behavior is unchanged until the admin adds a second bot.
+    """
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(telegram_config)").fetchall()]
+        if not columns:
+            return
+        changed = False
+        if "name" not in columns:
+            conn.execute("ALTER TABLE telegram_config ADD COLUMN name TEXT DEFAULT 'Telegram Bot'")
+            changed = True
+        if "is_notifier" not in columns:
+            conn.execute("ALTER TABLE telegram_config ADD COLUMN is_notifier BOOLEAN DEFAULT 0")
+            # Pre-existing single-bot deployments keep notifying from their
+            # only bot so behavior doesn't silently change on upgrade.
+            conn.execute("UPDATE telegram_config SET is_notifier = 1")
+            changed = True
+        if changed:
+            conn.commit()
+            logging.getLogger(__name__).info("Migrated: added multi-bot columns to telegram_config")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"telegram_config multi-bot migration failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _migrate_backfill_task_folders():
