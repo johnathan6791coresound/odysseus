@@ -16,11 +16,63 @@ services:
       # land under /app/.local for the odysseus user. Persist them so a
       # container recreate does not silently remove installed serve engines.
       - ${APP_DATA_DIR:-./data}/local:/app/.local:z
+      # Claude Code CLI's OAuth credentials (`claude login`). Persisted here so
+      # a container recreate does not force re-authentication. Run
+      # `docker exec -it <container> claude login` once after first startup.
+      - ${APP_DATA_DIR:-./data}/claude-cli:/app/.claude:z
+      # Live source bind-mounts for the Claude Code CLI backend: lets the
+      # in-container agent's edit_file/write_file calls modify the REAL host
+      # repo (not just the image's baked-in COPY snapshot), and restarting
+      # the container picks up its changes immediately. Deliberately NOT a
+      # whole-repo mount (`.:/app`) — that would also expose .env and .git
+      # to a process an LLM agent can write through. Only known application
+      # source directories/files are listed; add more here as needed.
+      - ./core:/app/core:z
+      - ./docker:/app/docker:z
+      - ./integrations:/app/integrations:z
+      - ./mcp_servers:/app/mcp_servers:z
+      - ./routes:/app/routes:z
+      - ./scripts:/app/scripts:z
+      - ./services:/app/services:z
+      - ./src:/app/src:z
+      - ./static:/app/static:z
+      - ./app.py:/app/app.py:z
+      - ./launcher.py:/app/launcher.py:z
+      - ./setup.py:/app/setup.py:z
+      # Read-only view of the host's Claude Code project config for
+      # `git/`. This is the canonical source of Studycast skills, subagent
+      # specs, and CLAUDE.md project instructions — Odysseus reads/syncs
+      # from these live files rather than storing its own duplicate copies,
+      # so editing a skill in the Claude Code app takes effect here too.
+      # Mounted read-only: Odysseus should never write into this tree.
+      - ${STUDYCAST_CLAUDE_DIR:-../git/.claude}:/app/claude-source:ro,z
+      - ${STUDYCAST_ROOT_CLAUDE_MD:-../git/CLAUDE.md}:/app/claude-source-root/CLAUDE.md:ro,z
+      # Global Claude Code MCP server definitions — canonical source for the
+      # MCP server sync script (scripts/sync_studycast_mcp_servers.py).
+      - ${STUDYCAST_MCP_JSON:-../.claude/.mcp.json}:/app/claude-source-root/mcp.json:ro,z
+      # Studycast repo checkouts, shared with the studycast-devenv stack via
+      # its external named volumes. Read-write so the in-container agent can
+      # actually edit the code, same as it does with coreweb-web/coreweb-worker.
+      - src_cwroot:/workspace/cwroot
+      - src_cwcommon:/workspace/cwcommon
+      - src_cwbin:/workspace/cwbin
+      - src_sse:/workspace/sse
+      - src_sqs:/workspace/sqs
+      - src_viewerbuild:/workspace/viewerbuild
+      # Whole local git/ tree, read-write, per explicit request. NOTE: unlike
+      # the scoped mounts above, this exposes every repo under git/ including
+      # any .env files and .git internals to the in-container agent.
+      - ${STUDYCAST_GIT_ROOT:-../git}:/app/host-git:z
+    networks:
+      - default
+      - coreweb-network
+      - automation-network
     extra_hosts:
       # Lets the container reach local services on the Docker host, including
       # Ollama at http://host.docker.internal:11434.
       - "host.docker.internal:host-gateway"
     environment:
+      - TZ=${TZ:-America/New_York}
       - LLM_HOST=${LLM_HOST:-localhost}
       - LLM_HOSTS=${LLM_HOSTS:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
@@ -108,7 +160,7 @@ services:
         fi
         exec /usr/local/searxng/entrypoint.sh
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8090:8080"
     volumes:
       - searxng-data:/etc/searxng
       - ./config/searxng/settings.yml:/tmp/searxng-settings.yml.template:ro,z
@@ -148,7 +200,28 @@ services:
       - NTFY_BASE_URL=${NTFY_BASE_URL:-http://localhost:8091}
     restart: unless-stopped
 
+networks:
+  default:
+  coreweb-network:
+    name: studycast-devenv_coreweb-network
+    external: true
+  automation-network:
+    name: automation_default
+    external: true
+
 volumes:
   searxng-data:
   chromadb-data:
   ntfy-cache:
+  src_cwroot:
+    external: true
+  src_cwcommon:
+    external: true
+  src_cwbin:
+    external: true
+  src_sse:
+    external: true
+  src_sqs:
+    external: true
+  src_viewerbuild:
+    external: true

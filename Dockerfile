@@ -28,11 +28,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     npm \
     tmux \
     openssh-client \
+    sshpass \
     gosu \
     libgl1 \
     libglib2.0-0t64 \
     libxcb1 \
     libmagic1 \
+    tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # libgl1/libglib2.0-0t64/libxcb1 are runtime shared libs (libGL.so.1,
@@ -67,6 +69,12 @@ RUN ARCH="$(dpkg --print-architecture)" \
     && install -m 0755 /tmp/docker/docker /usr/local/bin/docker \
     && rm -rf /tmp/docker /tmp/docker.tgz
 
+# Claude Code CLI — lets Odysseus drive a real Claude Code session (authenticated
+# via `claude login`, using an Anthropic Team/Pro/Max subscription seat) as a
+# model backend instead of a metered API key. See src/llm_core.py's
+# "claude-cli" provider branch.
+RUN npm install -g @anthropic-ai/claude-code
+
 WORKDIR /app
 
 # Install Python deps first (layer cache). Optional extras (PyMuPDF AGPL, etc.)
@@ -80,6 +88,11 @@ RUN pip install --no-cache-dir -r requirements.txt \
 # Image-only (not in requirements.txt) because it needs the libmagic1 system
 # lib installed above; see the apt note near the top of this stage.
 RUN pip install --no-cache-dir python-magic==0.4.27
+
+# AWS CLI, invoked by the agent's `bash` tool once an "AWS CLI" CLI
+# integration (routes/cli_integration_routes.py) has written credentials
+# into ~/.aws/. Not in requirements.txt since it's a CLI tool, not a library.
+RUN pip install --no-cache-dir awscli
 
 # Pre-install the patched basicsr/gfpgan/facexlib wheels built in the
 # realesrgan-wheels stage (--no-deps keeps the image lean — torch & friends are

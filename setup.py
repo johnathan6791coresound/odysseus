@@ -41,6 +41,30 @@ def create_dirs():
         print(f"  [ok] {os.path.relpath(d, BASE_DIR)}/")
 
 
+def init_settings_file():
+    """Write data/settings.json with defaults if it doesn't exist yet.
+
+    load_settings() falls back to in-memory DEFAULT_SETTINGS when the file is
+    missing, so without this a fresh/wiped data/ volume runs on defaults that
+    were never persisted to disk — which reads as settings "reverting" after a
+    rebuild. Materializing the file guarantees a durable baseline that survives
+    container recreates (the data/ bind mount itself already persists). Safe to
+    re-run: never overwrites an existing file.
+    """
+    import json
+    from src.constants import SETTINGS_FILE
+    from src.settings import DEFAULT_SETTINGS
+    if os.path.exists(SETTINGS_FILE):
+        print("  [skip] settings.json already exists")
+        return
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_SETTINGS, f, indent=2)
+        print("  [ok] settings.json created with defaults")
+    except OSError as e:
+        print(f"  [warn] Could not create settings.json: {e}")
+
+
 def init_database():
     """Create all SQLAlchemy tables."""
     sys.path.insert(0, BASE_DIR)
@@ -254,6 +278,7 @@ def main():
 
     print("1. Creating directories...")
     create_dirs()
+    init_settings_file()
 
     print("\n2. Environment file...")
     create_env()

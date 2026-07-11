@@ -33,10 +33,17 @@ ODY_USER="$(getent passwd "$PUID" | cut -d: -f1)"
 # opted in, the socket is owned by root:<host docker gid>. Add the app user
 # to that group and later call gosu by username so supplementary groups are
 # retained.
+#
+# GID 0 is handled too: on Docker Desktop (Windows/macOS), docker.sock inside
+# the Desktop VM is owned by group 0, which is NOT the same as the real host's
+# root group — it's an internal VM group, so adding the app user to it here
+# does not grant access to anything outside this container. (On a bare-metal
+# shared Linux host where group 0 really is host root, ODYSSEUS_ENABLE_HOST_DOCKER
+# is already a full docker.sock root-equivalent grant regardless of this step.)
 DOCKER_SOCK="${DOCKER_SOCK:-/var/run/docker.sock}"
 if [ "${ODYSSEUS_ENABLE_HOST_DOCKER:-}" = "true" ] && [ -S "$DOCKER_SOCK" ]; then
     SOCK_GID="$(stat -c '%g' "$DOCKER_SOCK" 2>/dev/null || echo '')"
-    if [ -n "$SOCK_GID" ] && [ "$SOCK_GID" != "0" ]; then
+    if [ -n "$SOCK_GID" ]; then
         if ! getent group "$SOCK_GID" >/dev/null 2>&1; then
             groupadd -g "$SOCK_GID" docker_host || true
         fi
@@ -71,7 +78,7 @@ repair_tree_ownership() {
 repair_app_tree_ownership() {
     if [ -d /app ]; then
         find /app -xdev \
-            \( -path /app/data -o -path /app/logs -o -path /app/.ssh -o -path /app/.cache -o -path /app/.local \) -prune \
+            \( -path /app/data -o -path /app/logs -o -path /app/.ssh -o -path /app/.cache -o -path /app/.local -o -path /app/.claude \) -prune \
             -o -not -uid "$PUID" -print0 2>/dev/null \
             | xargs -0 -r chown "$PUID:$PGID" 2>/dev/null || true
     fi
@@ -96,7 +103,7 @@ repair_bind_mount_ownership() {
 # Repair image-owned writable paths without walking into bind-mounted host
 # trees, then repair the app-owned mount roots separately.
 repair_app_tree_ownership
-for dir in /app/data /app/logs /app/.ssh /app/.cache/huggingface /app/.local; do
+for dir in /app/data /app/logs /app/.ssh /app/.cache/huggingface /app/.local /app/.claude; do
     repair_bind_mount_ownership "$dir"
 done
 

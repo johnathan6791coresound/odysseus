@@ -102,3 +102,10 @@ compound.config.json
 *.error.log
 _scratch/
 /odysseus/
+
+.env.bak
+
+# Studycast-internal, not for public fork
+scripts/import_studycast_memory.py
+scripts/sync_studycast_mcp_servers.py
+scripts/sync_studycast_skills.py
