@@ -386,6 +386,8 @@ async def maybe_compact(
             max_tokens=SUMMARY_MAX_TOKENS,
             headers=compact_headers,
             timeout=30,
+            role="utility",
+            owner=owner,
         )
     except Exception as e:
         logger.error(f"Compaction summary failed: {e}")
@@ -419,14 +421,20 @@ async def maybe_compact(
 
 def _update_session_history(session, split_point: int, summary: str,
                             system_msg_count: int = 0):
-    """Update the in-memory session history after compaction.
+    """Update the session history after compaction — non-destructively.
 
     `split_point` is the index in `convo_msgs` (system-stripped). The
     in-memory `session.history` includes leading system messages, so the
     actual recent-history slice starts at `system_msg_count + split_point`.
-    Prepending `session.history[:system_msg_count]` to the new history
-    preserves persona, preset, and RAG system messages that would
-    otherwise be dropped.
+    The messages before that point (excluding the leading system prefix)
+    are the ones being summarized.
+
+    These summarized messages are flagged `compacted_out` rather than
+    deleted from `session.history` or the database (see
+    `SessionManager.soft_compact_messages`) — a session touched from one
+    interface (e.g. Telegram) while compaction fires must not erase
+    history still visible from another (e.g. the web UI). Only the
+    LLM-facing view (`get_context_messages`) skips flagged messages.
     """
     if not session or not hasattr(session, "history"):
         return
@@ -435,22 +443,35 @@ def _update_session_history(session, split_point: int, summary: str,
     if effective_split >= len(session.history):
         return
 
-    # Keep the recent messages, prepend summary AND the leading system
-    # messages so the system prompt survives compaction.
-    system_prefix = list(session.history[:system_msg_count])
-    recent_history = session.history[effective_split:]
+    hidden_messages = session.history[system_msg_count:effective_split]
     summary_msg = ChatMessage(
         role="system",
         content=f"[Conversation summary]\n{summary}",
         metadata={"compacted": True, "summarized_count": split_point},
     )
-    new_history = system_prefix + [summary_msg] + recent_history
+
     try:
         from core.models import get_session_manager_instance
         manager = get_session_manager_instance()
     except Exception:
         manager = None
-    if manager and getattr(session, "id", None):
-        if manager.replace_messages(session.id, new_history):
-            return
-    session.history = new_history
+
+    persisted = bool(manager and getattr(session, "id", None)
+                      and manager.soft_compact_messages(session.id, hidden_messages, summary_msg))
+
+    # Flag the hidden messages in-memory too (harmless no-op if `persisted`
+    # already mutated the same ChatMessage objects) and insert the summary
+    # right after them, so `session.history` stays chronological and keeps
+    # showing the full transcript rather than dropping the older half.
+    for msg in hidden_messages:
+        msg.metadata = dict(msg.metadata or {})
+        msg.metadata["compacted_out"] = True
+    session.history.insert(effective_split, summary_msg)
+    session.message_count = len(session.history)
+
+    if not persisted:
+        logger.warning(
+            "Compaction summary for session %s could not be persisted "
+            "(session manager unavailable) — kept in-memory only",
+            getattr(session, "id", None),
+        )

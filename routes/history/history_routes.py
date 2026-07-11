@@ -700,26 +700,42 @@ def setup_history_routes(session_manager) -> APIRouter:
                 content=f"**Conversation compacted** — {len(older)} messages summarized, {len(recent)} kept.",
                 metadata={"compacted": True, "messages_removed": len(older)},
             )
-            new_history = [system_summary, summary_msg] + list(recent)
-            session.history = new_history
+            # Non-destructive: flag `older` as hidden-from-context instead of
+            # dropping them from history, so the full transcript survives —
+            # in the database and here in memory — for any other interface
+            # (e.g. the web UI vs. the Telegram bridge) reading the same
+            # session mid-conversation. get_context_messages() skips
+            # `compacted_out` rows, so the LLM still only sees the summary
+            # + recent tail; nothing is lost for display/audit.
+            for m in older:
+                if isinstance(m, ChatMessage):
+                    m.metadata = dict(m.metadata or {})
+                    m.metadata["compacted_out"] = True
+            session.history = list(older) + [system_summary, summary_msg] + list(recent)
             session.message_count = len(session.history)
             logger.info(f"Compact: session {session_id} history now has {len(session.history)} messages (was {msg_count_before})")
 
-            # Update DB: delete old messages, insert summary
+            # Update DB: flag old messages hidden-from-context, insert summary
             db = SessionLocal()
             try:
                 db_msgs = db.query(DbChatMessage).filter(
                     DbChatMessage.session_id == session_id
                 ).order_by(DbChatMessage.timestamp).all()
 
-                # Delete all but the last keep_count
-                for m in db_msgs[:-keep_count]:
-                    db.delete(m)
-
-                # Insert system summary (hidden, for AI context) and visible summary
                 import json as _json
                 import uuid
                 from datetime import datetime, timezone
+
+                # Flag all but the last keep_count as hidden-from-context —
+                # do NOT delete them.
+                for m in db_msgs[:-keep_count]:
+                    meta = _json.loads(m.meta_data) if m.meta_data else {}
+                    if meta is None:
+                        meta = {}
+                    meta["compacted_out"] = True
+                    m.meta_data = _json.dumps(meta)
+
+                # Insert system summary (hidden, for AI context) and visible summary
                 now = datetime.now(timezone.utc)
                 db_sys_summary = DbChatMessage(
                     id=str(uuid.uuid4()),
@@ -740,10 +756,10 @@ def setup_history_routes(session_manager) -> APIRouter:
                 )
                 db.add(db_summary)
 
-                # Update session record
+                # Update session record — nothing was deleted, only two rows added.
                 db_session = db.query(DbSession).filter(DbSession.id == session_id).first()
                 if db_session:
-                    db_session.message_count = len(session.history)
+                    db_session.message_count = (db_session.message_count or 0) + 2
                     db_session.updated_at = datetime.now(timezone.utc)
                 db.commit()
             finally:

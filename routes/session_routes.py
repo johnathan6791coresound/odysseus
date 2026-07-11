@@ -983,15 +983,22 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
                 "timestamp": utcnow_naive().isoformat(),
             },
         )
-        new_history = [summary_msg] + recent
-        if not session_manager.replace_messages(session_id, new_history):
+        # Non-destructive: flag `older` as hidden-from-context instead of
+        # deleting them, and insert the summary. Nothing is removed from
+        # chat_messages or session.history — see soft_compact_messages.
+        if not session_manager.soft_compact_messages(session_id, older, summary_msg):
             raise HTTPException(500, "Failed to save compacted history")
+        for msg in older:
+            msg.metadata = dict(msg.metadata or {})
+            msg.metadata["compacted_out"] = True
+        session.history.insert(len(session.history) - len(recent), summary_msg)
+        session.message_count = len(session.history)
 
         return {
             "ok": True,
             "summarized": len(older),
             "kept": len(recent),
-            "message_count": len(new_history),
+            "message_count": len(session.history),
         }
 
     @router.post("/sessions/auto-sort")

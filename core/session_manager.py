@@ -120,6 +120,12 @@ class SessionManager:
                 headers = json.loads(headers)
             except json.JSONDecodeError:
                 headers = {}
+        loaded_tools = getattr(db_session, "loaded_tools", None)
+        if isinstance(loaded_tools, str):
+            try:
+                loaded_tools = json.loads(loaded_tools)
+            except json.JSONDecodeError:
+                loaded_tools = []
         session = Session(
             id=db_session.id,
             name=db_session.name,
@@ -131,6 +137,7 @@ class SessionManager:
             history=[],
             owner=getattr(db_session, "owner", None),
             is_important=getattr(db_session, "is_important", False) or False,
+            loaded_tools=loaded_tools or [],
         )
         session.message_count = getattr(db_session, "message_count", 0) or 0
         return session
@@ -178,6 +185,13 @@ class SessionManager:
             except json.JSONDecodeError:
                 headers = {}
 
+        loaded_tools = getattr(db_session, "loaded_tools", None)
+        if isinstance(loaded_tools, str):
+            try:
+                loaded_tools = json.loads(loaded_tools)
+            except json.JSONDecodeError:
+                loaded_tools = []
+
         session = Session(
             id=db_session.id,
             name=db_session.name,
@@ -189,6 +203,7 @@ class SessionManager:
             history=history,
             owner=getattr(db_session, 'owner', None),
             is_important=getattr(db_session, 'is_important', False) or False,
+            loaded_tools=loaded_tools or [],
         )
 
         session.message_count = getattr(db_session, 'message_count', len(history))
@@ -312,6 +327,80 @@ class SessionManager:
 
         except Exception as e:
             logger.error(f"Error truncating session: {e}")
+            db.rollback()
+            return False
+        finally:
+            db.close()
+
+    def soft_compact_messages(self, session_id: str, hidden_messages: list,
+                               summary_message) -> bool:
+        """Non-destructively compact history: flag the summarized messages
+        as hidden-from-context instead of deleting them, and insert the
+        summary as a new row.
+
+        Unlike `replace_messages`, nothing is ever removed from
+        `chat_messages` — the full transcript stays intact in the database
+        (and in `session.history`) for display/audit. Only the LLM-facing
+        view (`Session.get_context_messages`) skips rows flagged
+        `compacted_out`, so context stays small on later turns without
+        destroying history a user might switch back to from another
+        interface (e.g. web UI <-> Telegram) mid-conversation.
+        """
+        session = self.get_session(session_id)
+        db = SessionLocal()
+        try:
+            now = datetime.now(timezone.utc)
+            hidden_count = 0
+            for msg in hidden_messages:
+                db_id = (msg.metadata or {}).get("_db_id")
+                if not db_id:
+                    continue
+                db_msg = db.query(DbChatMessage).filter(DbChatMessage.id == db_id).first()
+                if not db_msg:
+                    continue
+                meta = json.loads(db_msg.meta_data) if db_msg.meta_data else {}
+                if meta is None:
+                    meta = {}
+                meta["compacted_out"] = True
+                db_msg.meta_data = json.dumps(meta)
+                hidden_count += 1
+
+            summary_id = str(uuid.uuid4())
+            summary_meta = dict(summary_message.metadata or {})
+            db_summary = DbChatMessage(
+                id=summary_id,
+                session_id=session_id,
+                role=summary_message.role,
+                content=(json.dumps(summary_message.content)
+                         if isinstance(summary_message.content, list)
+                         else summary_message.content),
+                meta_data=json.dumps(summary_meta) if summary_meta else None,
+                # Timestamp it just after "now" minus a hair so it sorts
+                # right before whatever comes next, keeping it in the
+                # correct chronological slot relative to the hidden block.
+                timestamp=now,
+            )
+            db.add(db_summary)
+
+            db_session = db.query(DbSession).filter(DbSession.id == session_id).first()
+            if db_session:
+                db_session.updated_at = now
+                # Nothing was deleted, only a summary row added — bump the
+                # count by one rather than shrinking it to len(kept).
+                db_session.message_count = (db_session.message_count or 0) + 1
+
+            db.commit()
+
+            summary_meta["_db_id"] = summary_id
+            summary_message.metadata = summary_meta
+
+            logger.info(
+                "Soft-compacted session %s: flagged %d message(s) hidden-from-context, "
+                "added summary — nothing deleted", session_id, hidden_count,
+            )
+            return True
+        except Exception as e:
+            logger.error("Error soft-compacting session history: %s", e)
             db.rollback()
             return False
         finally:
@@ -594,6 +683,34 @@ class SessionManager:
             raise
         finally:
             db.close()
+
+    def add_loaded_tools(self, session_id: str, names) -> list:
+        """Persist newly `load_tools`-loaded tool names onto a session so
+        they're available on every later message, not just the rest of the
+        current turn. Returns the session's full loaded_tools list after the
+        merge. Safe to call with names already present (de-duplicates)."""
+        if session_id not in self.sessions:
+            return []
+
+        session = self.sessions[session_id]
+        merged = sorted(set(session.loaded_tools or []) | set(names))
+        if merged == sorted(session.loaded_tools or []):
+            return session.loaded_tools  # no-op, skip the DB write
+
+        db = SessionLocal()
+        try:
+            db_session = db.query(DbSession).filter(DbSession.id == session_id).first()
+            if db_session:
+                db_session.loaded_tools = merged
+                db_session.updated_at = datetime.now(timezone.utc)
+                db.commit()
+                session.loaded_tools = merged
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Error persisting loaded_tools: {e}")
+        finally:
+            db.close()
+        return session.loaded_tools
 
     def mark_important(self, session_id: str, important: bool = True):
         """Mark session as important."""

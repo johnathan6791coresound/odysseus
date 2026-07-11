@@ -55,6 +55,7 @@ class _FakeSessionManager:
         self.session = session
         self.saved = False
         self.replaced_messages = None
+        self.soft_compacted = None
 
     def get_session(self, session_id):
         if session_id != self.session.id:
@@ -70,6 +71,17 @@ class _FakeSessionManager:
         self.replaced_messages = list(messages)
         self.session.history = list(messages)
         self.session.message_count = len(messages)
+        return True
+
+    def soft_compact_messages(self, session_id, hidden_messages, summary_message):
+        # Non-destructive contract: flag `hidden_messages` instead of
+        # removing anything from session.history.
+        if session_id != self.session.id:
+            return False
+        self.soft_compacted = (list(hidden_messages), summary_message)
+        for m in hidden_messages:
+            m.metadata = dict(m.metadata or {})
+            m.metadata["compacted_out"] = True
         return True
 
 
@@ -218,7 +230,7 @@ def test_registered_manual_compact_route_tolerates_none_content(monkeypatch):
     compact_prompt = captured["messages"][1]["content"]
     assert "ASSISTANT: None" not in compact_prompt
     assert "ASSISTANT: " in compact_prompt
-    assert manager.replaced_messages is not None
+    assert manager.soft_compacted is not None
 
 
 def test_registered_manual_compact_route_uses_session_owner(monkeypatch):
@@ -235,7 +247,7 @@ def test_registered_manual_compact_route_uses_session_owner(monkeypatch):
     )
 
     assert response.status_code == 200
-    assert manager.replaced_messages is not None
+    assert manager.soft_compacted is not None
     assert ("utility", "session-owner") in captured["resolve_calls"]
 
 
@@ -256,4 +268,4 @@ def test_registered_manual_compact_route_rejects_active_agent_run(monkeypatch):
     assert response.status_code == 409
     assert "active run" in response.text
     assert captured == {}
-    assert manager.replaced_messages is None
+    assert manager.soft_compacted is None
