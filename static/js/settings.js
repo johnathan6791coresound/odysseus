@@ -5521,53 +5521,55 @@ async function initUnifiedIntegrations() {
     formEl.innerHTML = `
       <div class="admin-card" style="margin-top:8px">
         <h2 style="font-size:13px">Add CLI Integration</h2>
-        <div class="settings-row">
-          <label class="settings-label">Kind</label>
-          <select id="uf-cli-kind" class="settings-select">
-            <option value="git_ssh">Git (SSH keypair)</option>
-            <option value="aws_cli">AWS CLI (access key)</option>
-          </select>
-        </div>
-        <div id="uf-cli-fields-git">
-          <div style="font-size:11px;opacity:0.6;margin:8px 0 10px">Generates a dedicated SSH keypair. You'll add the public key to the host's account settings (e.g. GitHub → Settings → SSH Keys) before it can connect.</div>
+        <div class="settings-col">
           <div class="settings-row">
-            <label class="settings-label">Name</label>
-            <input type="text" id="uf-cli-name" class="settings-input" placeholder="e.g. GitHub">
+            <label class="settings-label">Kind</label>
+            <select id="uf-cli-kind" class="settings-select">
+              <option value="git_ssh">Git (SSH keypair)</option>
+              <option value="aws_cli">AWS CLI (access key)</option>
+            </select>
           </div>
-          <div class="settings-row">
-            <label class="settings-label">Host</label>
-            <input type="text" id="uf-cli-host" class="settings-input" placeholder="e.g. github.com">
+          <div id="uf-cli-fields-git" class="settings-col">
+            <div style="font-size:11px;opacity:0.6;">Generates a dedicated SSH keypair. You'll add the public key to the host's account settings (e.g. GitHub → Settings → SSH Keys) before it can connect.</div>
+            <div class="settings-row">
+              <label class="settings-label">Name</label>
+              <input type="text" id="uf-cli-name" class="settings-input" placeholder="e.g. GitHub">
+            </div>
+            <div class="settings-row">
+              <label class="settings-label">Host</label>
+              <input type="text" id="uf-cli-host" class="settings-input" placeholder="e.g. github.com">
+            </div>
+            <div class="settings-row">
+              <label class="settings-label">Port</label>
+              <input type="number" id="uf-cli-port" class="settings-input" value="22" style="max-width:90px">
+              <label class="settings-label">SSH user</label>
+              <input type="text" id="uf-cli-user" class="settings-input" value="git">
+            </div>
           </div>
-          <div class="settings-row">
-            <label class="settings-label">Port</label>
-            <input type="number" id="uf-cli-port" class="settings-input" value="22">
-            <label class="settings-label">SSH user</label>
-            <input type="text" id="uf-cli-user" class="settings-input" value="git">
+          <div id="uf-cli-fields-aws" class="settings-col" style="display:none">
+            <div style="font-size:11px;opacity:0.6;">Stores the key in a dedicated AWS CLI profile (~/.aws). Use an IAM user scoped to only what the agent needs.</div>
+            <div class="settings-row">
+              <label class="settings-label">Name</label>
+              <input type="text" id="uf-cli-aws-name" class="settings-input" placeholder="e.g. AWS (prod)">
+            </div>
+            <div class="settings-row">
+              <label class="settings-label">Access key ID</label>
+              <input type="text" id="uf-cli-aws-key" class="settings-input">
+            </div>
+            <div class="settings-row">
+              <label class="settings-label">Secret access key</label>
+              <input type="password" id="uf-cli-aws-secret" class="settings-input">
+            </div>
+            <div class="settings-row">
+              <label class="settings-label">Region</label>
+              <input type="text" id="uf-cli-aws-region" class="settings-input" value="us-east-1">
+            </div>
           </div>
-        </div>
-        <div id="uf-cli-fields-aws" style="display:none">
-          <div style="font-size:11px;opacity:0.6;margin:8px 0 10px">Stores the key in a dedicated AWS CLI profile (~/.aws). Use an IAM user scoped to only what the agent needs.</div>
-          <div class="settings-row">
-            <label class="settings-label">Name</label>
-            <input type="text" id="uf-cli-aws-name" class="settings-input" placeholder="e.g. AWS (prod)">
+          <div class="settings-row" style="margin-top:4px;justify-content:flex-end;">
+            <span id="uf-cli-create-msg" style="font-size:11px;flex:1;margin-right:8px"></span>
+            <button class="admin-btn-add" id="uf-cli-create-cancel" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">Cancel</button>
+            <button class="admin-btn-add" id="uf-cli-create-save">Save</button>
           </div>
-          <div class="settings-row">
-            <label class="settings-label">Access key ID</label>
-            <input type="text" id="uf-cli-aws-key" class="settings-input">
-          </div>
-          <div class="settings-row">
-            <label class="settings-label">Secret access key</label>
-            <input type="password" id="uf-cli-aws-secret" class="settings-input">
-          </div>
-          <div class="settings-row">
-            <label class="settings-label">Region</label>
-            <input type="text" id="uf-cli-aws-region" class="settings-input" value="us-east-1">
-          </div>
-        </div>
-        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:10px;justify-content:flex-end;">
-          <span id="uf-cli-create-msg" style="font-size:11px;flex:1;margin-right:8px"></span>
-          <button class="admin-btn-add" id="uf-cli-create-cancel" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">Cancel</button>
-          <button class="admin-btn-add" id="uf-cli-create-save">Save</button>
         </div>
       </div>`;
     const kindSel = el('uf-cli-kind');
@@ -5681,42 +5683,42 @@ async function initUnifiedIntegrations() {
     formEl.innerHTML = `
       <div class="admin-card" style="margin-top:8px">
         <h2 style="font-size:13px">Add SSH Connection</h2>
-        <div style="font-size:11px;opacity:0.6;margin-bottom:10px">For direct access to a server (not a git remote).</div>
-        <div class="settings-row">
-          <label class="settings-label">Name</label>
-          <input type="text" id="uf-ssh-name" class="settings-input" placeholder="e.g. App Server">
-        </div>
-        <div class="settings-row">
-          <label class="settings-label">Host</label>
-          <input type="text" id="uf-ssh-host" class="settings-input" placeholder="e.g. 10.0.1.20 or app.internal">
-        </div>
-        <div class="settings-row">
-          <label class="settings-label">Port</label>
-          <input type="number" id="uf-ssh-port" class="settings-input" value="22">
-          <label class="settings-label">SSH user</label>
-          <input type="text" id="uf-ssh-user" class="settings-input" value="root">
-        </div>
-        <div class="settings-row">
-          <label class="settings-label">Auth method</label>
-          <select id="uf-ssh-auth-method" class="settings-select">
-            <option value="key">SSH keypair (generated, you add the public key to the host)</option>
-            <option value="password">Username + password (stored encrypted)</option>
-          </select>
-        </div>
-        <div id="uf-ssh-password-field" style="display:none">
+        <div class="settings-col">
+          <div style="font-size:11px;opacity:0.6;">For direct access to a server (not a git remote).</div>
           <div class="settings-row">
+            <label class="settings-label">Name</label>
+            <input type="text" id="uf-ssh-name" class="settings-input" placeholder="e.g. App Server">
+          </div>
+          <div class="settings-row">
+            <label class="settings-label">Host</label>
+            <input type="text" id="uf-ssh-host" class="settings-input" placeholder="e.g. 10.0.1.20 or app.internal">
+          </div>
+          <div class="settings-row">
+            <label class="settings-label">Port</label>
+            <input type="number" id="uf-ssh-port" class="settings-input" value="22" style="max-width:90px">
+            <label class="settings-label">SSH user</label>
+            <input type="text" id="uf-ssh-user" class="settings-input" value="root">
+          </div>
+          <div class="settings-row">
+            <label class="settings-label">Auth method</label>
+            <select id="uf-ssh-auth-method" class="settings-select">
+              <option value="key">SSH keypair (generated, you add the public key to the host)</option>
+              <option value="password">Username + password (stored encrypted)</option>
+            </select>
+          </div>
+          <div id="uf-ssh-password-field" class="settings-row" style="display:none">
             <label class="settings-label">Password</label>
             <input type="password" id="uf-ssh-password" class="settings-input">
           </div>
-        </div>
-        <div class="settings-row">
-          <label class="settings-label">Note</label>
-          <input type="text" id="uf-ssh-note" class="settings-input" placeholder="what this box is for (optional)">
-        </div>
-        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:10px;justify-content:flex-end;">
-          <span id="uf-ssh-create-msg" style="font-size:11px;flex:1;margin-right:8px"></span>
-          <button class="admin-btn-add" id="uf-ssh-create-cancel" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">Cancel</button>
-          <button class="admin-btn-add" id="uf-ssh-create-save">Save</button>
+          <div class="settings-row">
+            <label class="settings-label">Note</label>
+            <input type="text" id="uf-ssh-note" class="settings-input" placeholder="what this box is for (optional)">
+          </div>
+          <div class="settings-row" style="margin-top:4px;justify-content:flex-end;">
+            <span id="uf-ssh-create-msg" style="font-size:11px;flex:1;margin-right:8px"></span>
+            <button class="admin-btn-add" id="uf-ssh-create-cancel" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">Cancel</button>
+            <button class="admin-btn-add" id="uf-ssh-create-save">Save</button>
+          </div>
         </div>
       </div>`;
     const authSel = el('uf-ssh-auth-method');
