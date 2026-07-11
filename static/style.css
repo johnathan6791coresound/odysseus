@@ -2368,7 +2368,8 @@ body.bg-pattern-sparkles {
       width: 100%;
       position: relative;
     }
-    .chat-input-top > .model-picker-wrap {
+    .chat-input-top > .model-picker-wrap,
+    .chat-input-top > .claude-effort-wrap {
       position: absolute;
       top: 0;
       right: 0;
@@ -2377,20 +2378,9 @@ body.bg-pattern-sparkles {
       transition: opacity 0.22s ease, transform 0.22s ease;
       will-change: opacity, transform;
     }
-    .chat-input-top > .claude-effort-wrap {
-      position: absolute;
-      top: 0;
-      /* Sits just left of the model picker (right:0) instead of on top of it. */
-      right: 84px;
-      z-index: 250;
-      transition: opacity 0.22s ease, transform 0.22s ease;
-      will-change: opacity, transform;
-    }
-    .chat-input-top > .model-picker-wrap.model-picker-autohide {
-      opacity: 0;
-      pointer-events: none;
-      transform: translateY(-4px) scale(0.96);
-    }
+    /* Effort picker sits just left of the model picker (right:0) instead of on top of it. */
+    .chat-input-top > .claude-effort-wrap { right: 84px; }
+    .chat-input-top > .model-picker-wrap.model-picker-autohide,
     .chat-input-top > .claude-effort-wrap.claude-effort-autohide {
       opacity: 0;
       pointer-events: none;

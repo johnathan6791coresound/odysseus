@@ -2504,10 +2504,10 @@
             <div class="admin-toggle-sub" style="margin-bottom:10px;">Estimated LLM spend from recorded usage. Utility/research/task spend collapsing toward $0 means cost auto-routing is working.</div>
             <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px;flex-wrap:wrap;">
               <button class="admin-btn-sm" id="usage-refresh-btn">Refresh</button>
-              <label class="admin-switch-inline" style="display:inline-flex;align-items:center;gap:6px;font-size:12px;">
+              <div class="admin-switch-inline" title="Auto-refresh usage stats">
                 <label class="admin-switch"><input type="checkbox" id="usage-autorefresh-toggle"><span class="admin-slider"></span></label>
                 Auto-refresh
-              </label>
+              </div>
               <select id="usage-autorefresh-interval" class="admin-btn-sm" style="font-size:11px;padding:3px 6px;">
                 <option value="10">every 10s</option>
                 <option value="30" selected>every 30s</option>

@@ -2084,7 +2084,7 @@ async function loadMcpServers() {
       // no `oauth_config` row, e.g. Atlassian) instead report
       // status === 'needs_auth' + a live `auth_url` — treat both as "needs auth".
       const needsAnyAuth = s.needs_oauth || s.status === 'needs_auth';
-      const statusColor = needsAnyAuth ? '#e5a33a' : s.status === 'connected' ? 'var(--fg)' : s.status === 'error' ? 'var(--red)' : 'color-mix(in srgb, var(--fg) 50%, transparent)';
+      const statusColor = needsAnyAuth ? 'var(--warn)' : s.status === 'connected' ? 'var(--fg)' : s.status === 'error' ? 'var(--red)' : 'color-mix(in srgb, var(--fg) 50%, transparent)';
       const toolInfo = s.status === 'connected' ? `${s.enabled_tool_count}/${s.tool_count} tools enabled` : '';
       const statusText = needsAnyAuth ? 'Needs authorization' : s.status === 'connected' ? `Connected (${toolInfo})` : s.status === 'error' ? `Error: ${s.error || 'unknown'}` : 'Disconnected';
       const hasTools = s.status === 'connected' && s.tool_count > 0;
@@ -2096,7 +2096,7 @@ async function loadMcpServers() {
             ${hasTools ? `<span style="font-size:10px;opacity:0.4;">Click to manage tools</span>` : ''}
           </div>
           <div style="display:flex;gap:4px;align-items:center;">
-            ${s.needs_oauth ? `<a href="/api/mcp/oauth/authorize/${s.id}" target="_blank" class="admin-btn-sm" style="background:var(--red);color:#fff;text-decoration:none;padding:3px 10px;border-radius:4px;font-size:11px;font-weight:600;">Authorize</a>` : s.status === 'needs_auth' ? `<button class="admin-btn-sm" data-adm-mcp-authorize="${s.id}" data-adm-mcp-authorize-url="${s.auth_url ? esc(s.auth_url) : ''}" style="background:var(--red);color:#fff;padding:3px 10px;border-radius:4px;font-size:11px;font-weight:600;">Authorize</button>` : ''}
+            ${s.needs_oauth ? `<a href="/api/mcp/oauth/authorize/${s.id}" target="_blank" class="admin-btn-sm" style="background:var(--accent, var(--red));color:#fff;text-decoration:none;padding:3px 10px;border-radius:4px;font-size:11px;font-weight:600;">Authorize</a>` : s.status === 'needs_auth' ? `<button class="admin-btn-sm" data-adm-mcp-authorize="${s.id}" data-adm-mcp-authorize-url="${s.auth_url ? esc(s.auth_url) : ''}" style="background:var(--accent, var(--red));color:#fff;padding:3px 10px;border-radius:4px;font-size:11px;font-weight:600;">Authorize</button>` : ''}
             <button class="admin-btn-sm" data-adm-mcp-reconnect="${s.id}">Reconnect</button>
             <button class="admin-btn-delete" style="border-color:${s.is_enabled ? 'color-mix(in srgb, var(--red) 30%, transparent)' : 'color-mix(in srgb, var(--fg) 30%, transparent)'};color:${s.is_enabled ? 'var(--red)' : 'var(--fg)'};" data-adm-mcp-toggle="${s.id}" data-adm-mcp-enable="${!s.is_enabled}">${s.is_enabled ? 'Disable' : 'Enable'}</button>
             <button class="admin-btn-delete" data-adm-mcp-delete="${s.id}">Delete</button>
