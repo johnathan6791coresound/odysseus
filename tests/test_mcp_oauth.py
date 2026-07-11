@@ -45,6 +45,25 @@ def test_build_provider_has_odysseus_client_metadata():
     assert str(md.redirect_uris[0]).rstrip("/") == mcp_oauth.REDIRECT_URI.rstrip("/")
 
 
+def test_requested_scope_defaults_to_offline_access(monkeypatch):
+    monkeypatch.delenv("MCP_OAUTH_SCOPE", raising=False)
+    assert mcp_oauth._requested_scope() == "offline_access"
+
+
+def test_requested_scope_env_override(monkeypatch):
+    monkeypatch.setenv("MCP_OAUTH_SCOPE", "read:jira-work offline_access")
+    assert mcp_oauth._requested_scope() == "read:jira-work offline_access"
+    # Empty override disables scope, restoring server-metadata selection.
+    monkeypatch.setenv("MCP_OAUTH_SCOPE", "  ")
+    assert mcp_oauth._requested_scope() is None
+
+
+def test_build_provider_requests_offline_access(monkeypatch):
+    monkeypatch.delenv("MCP_OAUTH_SCOPE", raising=False)
+    p = mcp_oauth.build_provider("srv-scope", "https://example.com/mcp")
+    assert p.context.client_metadata.scope == "offline_access"
+
+
 def test_db_token_storage_round_trip():
     from mcp.shared.auth import OAuthToken
 

@@ -32,6 +32,32 @@ REDIRECT_URI = f"{_REDIRECT_BASE}/api/mcp/oauth/callback"
 # How long the background connect waits for the user to authorize before giving up.
 AUTH_WAIT_SECONDS = 300
 
+# OAuth scope requested during the flow. Atlassian (and most OAuth 2.0 "3LO"
+# servers) only issue a refresh_token when `offline_access` is requested; without
+# it the access token expires (~1h) with no way to renew, so on the next Odysseus
+# restart the stored token is dead, there's nothing to refresh with, and the
+# server flips to needs_auth — forcing a browser re-authorization every time.
+# We therefore request offline_access by default. This is deliberately NOT a full
+# OIDC identity scope (openid/profile/email): those would break the many MCP
+# servers that aren't OpenID providers, which is why scope was previously left
+# unset. offline_access only governs refresh-token issuance and is widely
+# tolerated. Override per deployment with MCP_OAUTH_SCOPE (space-separated), or
+# set it empty to fall back to pure server-metadata scope selection.
+_DEFAULT_OAUTH_SCOPE = "offline_access"
+
+
+def _requested_scope() -> Optional[str]:
+    """Resolve the OAuth scope to request, honoring the MCP_OAUTH_SCOPE override.
+
+    Returns None when explicitly disabled (empty override), which restores the
+    SDK's server-metadata-driven scope selection.
+    """
+    raw = os.environ.get("MCP_OAUTH_SCOPE")
+    if raw is None:
+        return _DEFAULT_OAUTH_SCOPE
+    raw = raw.strip()
+    return raw or None
+
 _pending: Dict[str, asyncio.Future] = {}   # state -> Future[(code, state)]
 _pending_ts: Dict[str, float] = {}         # state -> monotonic timestamp, for pruning
 _auth_urls: Dict[str, str] = {}            # server_id -> authorization URL
@@ -151,11 +177,12 @@ def build_provider(server_id: str, url: str, on_redirect=None):
         redirect_uris=[REDIRECT_URI],
         grant_types=["authorization_code", "refresh_token"],
         response_types=["code"],
-        # Leave scope unset: the SDK applies the MCP scope-selection strategy and
-        # overwrites this from the server's WWW-Authenticate / protected-resource
-        # metadata before building the auth URL. Hardcoding an OIDC scope here
-        # would break the many MCP servers that are not OpenID providers.
-        scope=None,
+        # Request offline_access so servers that gate refresh-token issuance on it
+        # (e.g. Atlassian) return a durable refresh_token instead of forcing a
+        # browser re-auth after every access-token expiry / restart. See
+        # _requested_scope() / _DEFAULT_OAUTH_SCOPE above; set MCP_OAUTH_SCOPE=""
+        # to restore the SDK's pure server-metadata scope selection.
+        scope=_requested_scope(),
         token_endpoint_auth_method="none",
     )
 

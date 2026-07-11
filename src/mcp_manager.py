@@ -142,8 +142,14 @@ class McpManager:
         self._sessions: Dict[str, Any] = {}
         # server_id -> exit stack (for cleanup)
         self._stacks: Dict[str, Any] = {}
-        # server_id -> background connect task (HTTP transport / OAuth)
+        # server_id -> background connect task (HTTP transport / OAuth). This
+        # task owns the connection for its entire lifetime (see _connect_http);
+        # disconnecting means cancelling this task, not closing _stacks[server_id]
+        # from outside it (anyio cancel scopes are task-bound).
         self._connect_tasks: Dict[str, Any] = {}
+        # server_id -> outcome of the most recent _connect_http attempt, consumed
+        # once by _start_http_connect after its ready event fires.
+        self._connect_results: Dict[str, bool] = {}
         # Tracking updates to tools/connections for RAG indexing / prompt cache
         self._generation = 0
 
@@ -179,11 +185,38 @@ class McpManager:
             return False
 
     async def _connect_stdio(self, server_id: str, name: str, command: str, args: List[str], env: Dict[str, str]) -> bool:
-        """Connect to an MCP server via stdio transport."""
+        """Connect to an MCP server via stdio transport.
+
+        Spawns a long-lived owning task (see _run_stdio) for the same reason
+        _connect_http does: anyio cancel scopes are task-bound, so the
+        AsyncExitStack wrapping this subprocess/session must be opened and
+        closed by the same task, not by whatever task later calls
+        disconnect_server. Without this, shutdown logs "Attempted to exit
+        cancel scope in a different task than it was entered in" for every
+        stdio server (this was observed for the builtin rag/memory/image_gen/
+        email servers) and can leave the subprocess's pipes half torn-down.
+        """
+        import asyncio
+        ready = asyncio.Event()
+        task = asyncio.create_task(self._run_stdio(server_id, name, command, args, env, ready))
+        self._connect_tasks[server_id] = task
+        ready_task = asyncio.create_task(ready.wait())
+        try:
+            await asyncio.wait({ready_task, task}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            if not ready_task.done():
+                ready_task.cancel()
+        return self._connect_results.pop(server_id, False)
+
+    async def _run_stdio(self, server_id: str, name: str, command: str, args: List[str],
+                          env: Dict[str, str], ready: "asyncio.Event") -> None:
+        """Connect via stdio, then hold the connection open for as long as this
+        task lives — see _connect_stdio's docstring and _connect_http's for why."""
+        from contextlib import AsyncExitStack
+        stack = AsyncExitStack()
         try:
             from mcp import ClientSession, StdioServerParameters
             from mcp.client.stdio import stdio_client
-            from contextlib import AsyncExitStack
 
             server_params = StdioServerParameters(
                 command=command,
@@ -191,19 +224,14 @@ class McpManager:
                 env={**os.environ, **env} if env else None,
             )
 
-            stack = AsyncExitStack()
-            try:
-                transport = await stack.enter_async_context(stdio_client(server_params))
-                read_stream, write_stream = transport
-                session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
+            transport = await stack.enter_async_context(stdio_client(server_params))
+            read_stream, write_stream = transport
+            session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
 
-                await session.initialize()
+            await session.initialize()
 
-                # Discover tools
-                tools_result = await session.list_tools()
-            except Exception:
-                await stack.aclose()
-                raise
+            # Discover tools
+            tools_result = await session.list_tools()
             tools = []
             for tool in tools_result.tools:
                 tools.append({
@@ -217,7 +245,6 @@ class McpManager:
                 })
 
             self._sessions[server_id] = session
-            self._stacks[server_id] = stack
             self._tools[server_id] = tools
             # Extract identity hints from env vars (e.g. email address, API name)
             # so tool descriptions can distinguish between multiple instances of
@@ -238,33 +265,63 @@ class McpManager:
             }
 
             logger.info(f"MCP server connected: {name} ({server_id}) - {len(tools)} tools via stdio")
-            return True
+            self._connect_results[server_id] = True
+            ready.set()
 
+            # Block here for the connection's lifetime; disconnect_server()
+            # cancels this task to tear down, so the stack closes in-task below.
+            import asyncio
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise
         except ImportError:
             logger.warning("MCP package not installed. Install with: pip install mcp")
             self._connections[server_id] = {"status": "error", "error": "mcp package not installed", "name": name}
-            return False
+            self._connect_results[server_id] = False
+            ready.set()
+        except Exception as e:
+            logger.error(f"Failed to connect stdio MCP server {name} ({server_id}): {e}")
+            self._connections[server_id] = {"status": "error", "error": str(e), "name": name}
+            self._connect_results[server_id] = False
+            ready.set()
+        finally:
+            try:
+                await stack.aclose()
+            except Exception as e:
+                logger.warning(f"Error closing MCP server {server_id}: {e}")
 
     async def _connect_sse(self, server_id: str, name: str, url: str) -> bool:
-        """Connect to an MCP server via SSE transport."""
+        """Connect to an MCP server via SSE transport. See _connect_stdio's
+        docstring for why this spawns a long-lived owning task."""
+        import asyncio
+        ready = asyncio.Event()
+        task = asyncio.create_task(self._run_sse(server_id, name, url, ready))
+        self._connect_tasks[server_id] = task
+        ready_task = asyncio.create_task(ready.wait())
+        try:
+            await asyncio.wait({ready_task, task}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            if not ready_task.done():
+                ready_task.cancel()
+        return self._connect_results.pop(server_id, False)
+
+    async def _run_sse(self, server_id: str, name: str, url: str, ready: "asyncio.Event") -> None:
+        """Connect via SSE, then hold the connection open for as long as this
+        task lives — see _connect_stdio's docstring for why."""
+        from contextlib import AsyncExitStack
+        stack = AsyncExitStack()
         try:
             from mcp import ClientSession
             from mcp.client.sse import sse_client
-            from contextlib import AsyncExitStack
 
-            stack = AsyncExitStack()
-            try:
-                transport = await stack.enter_async_context(sse_client(url))
-                read_stream, write_stream = transport
-                session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
+            transport = await stack.enter_async_context(sse_client(url))
+            read_stream, write_stream = transport
+            session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
 
-                await session.initialize()
+            await session.initialize()
 
-                # Discover tools
-                tools_result = await session.list_tools()
-            except Exception:
-                await stack.aclose()
-                raise
+            # Discover tools
+            tools_result = await session.list_tools()
             tools = []
             for tool in tools_result.tools:
                 tools.append({
@@ -278,7 +335,6 @@ class McpManager:
                 })
 
             self._sessions[server_id] = session
-            self._stacks[server_id] = stack
             self._tools[server_id] = tools
             self._connections[server_id] = {
                 "status": "connected",
@@ -288,46 +344,83 @@ class McpManager:
             }
 
             logger.info(f"MCP server connected: {name} ({server_id}) - {len(tools)} tools via SSE")
-            return True
+            self._connect_results[server_id] = True
+            ready.set()
 
+            import asyncio
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise
         except ImportError:
             logger.warning("MCP package not installed. Install with: pip install mcp")
             self._connections[server_id] = {"status": "error", "error": "mcp package not installed", "name": name}
-            return False
+            self._connect_results[server_id] = False
+            ready.set()
+        except Exception as e:
+            logger.error(f"Failed to connect SSE MCP server {name} ({server_id}): {e}")
+            self._connections[server_id] = {"status": "error", "error": str(e), "name": name}
+            self._connect_results[server_id] = False
+            ready.set()
+        finally:
+            try:
+                await stack.aclose()
+            except Exception as e:
+                logger.warning(f"Error closing MCP server {server_id}: {e}")
 
     async def _start_http_connect(self, server_id: str, name: str, url: str, wait: float = 8.0) -> bool:
         """Begin a Streamable HTTP connect in the background. Returns within
         `wait` seconds: True if it connected (cached-token path), otherwise the
-        flow is awaiting browser authorization and status becomes 'needs_auth'."""
+        flow is awaiting browser authorization and status becomes 'needs_auth'.
+
+        `_connect_http` runs as a long-lived task for the entire life of the
+        connection (see its docstring for why), so we can't detect "connected"
+        by waiting for the task to finish — it only finishes on disconnect. A
+        dedicated `ready` event is set once the connect attempt (success or
+        failure) resolves, and `_connect_results` carries the outcome.
+        """
         import asyncio
         self._connections[server_id] = {"status": "connecting", "name": name, "transport": "http"}
-        task = asyncio.create_task(self._connect_http(server_id, name, url))
+        ready = asyncio.Event()
+        task = asyncio.create_task(self._connect_http(server_id, name, url, ready))
         self._connect_tasks[server_id] = task
-        done, _ = await asyncio.wait({task}, timeout=wait)
-        if task in done:
-            try:
-                return task.result()
-            except Exception as e:
-                self._connections[server_id] = {"status": "error", "error": str(e), "name": name}
-                return False
-        # Still running → either awaiting authorization, or discovery/DCR is
-        # still in flight. If _on_redirect already published needs_auth+auth_url,
-        # leave it; otherwise mark needs_auth (auth_url filled in once it fires).
-        from src.mcp_oauth import pop_auth_url
-        cur = self._connections.get(server_id, {})
-        if cur.get("status") != "needs_auth":
-            self._connections[server_id] = {
-                "status": "needs_auth", "name": name, "transport": "http",
-                "auth_url": pop_auth_url(server_id),
-            }
-        return False
+        try:
+            await asyncio.wait_for(ready.wait(), timeout=wait)
+        except asyncio.TimeoutError:
+            # Still running → either awaiting authorization, or discovery/DCR is
+            # still in flight. If _on_redirect already published needs_auth+auth_url,
+            # leave it; otherwise mark needs_auth (auth_url filled in once it fires).
+            from src.mcp_oauth import pop_auth_url
+            cur = self._connections.get(server_id, {})
+            if cur.get("status") != "needs_auth":
+                self._connections[server_id] = {
+                    "status": "needs_auth", "name": name, "transport": "http",
+                    "auth_url": pop_auth_url(server_id),
+                }
+            return False
+        return self._connect_results.pop(server_id, False)
 
-    async def _connect_http(self, server_id: str, name: str, url: str) -> bool:
-        """Connect to a Streamable HTTP MCP server (with automatic OAuth)."""
+    async def _connect_http(self, server_id: str, name: str, url: str, ready: "asyncio.Event") -> None:
+        """Connect to a Streamable HTTP MCP server (with automatic OAuth), then
+        hold the connection open for as long as this task lives.
+
+        This task — not `disconnect_server`'s caller — owns the AsyncExitStack
+        below, because anyio cancel scopes (used internally by the streamable-HTTP
+        transport) are bound to the task that entered them: closing the stack
+        from a different task raises "Attempted to exit cancel scope in a
+        different task than it was entered in" and can leave the transport's
+        background read-loop half torn-down, silently corrupting subsequent
+        tool-call responses (observed as tool calls returning empty content
+        while the server still reports "connected"). Keeping this task alive
+        until cancelled — and closing the stack in its own `finally` — means
+        teardown always happens in the owning task, whether triggered by
+        `disconnect_server` cancelling us or a fatal error below.
+        """
+        import asyncio
+        from contextlib import AsyncExitStack
+        stack = AsyncExitStack()
         try:
             from mcp import ClientSession
             from mcp.client.streamable_http import streamablehttp_client
-            from contextlib import AsyncExitStack
             from src.mcp_oauth import build_provider, clear_auth_url
 
             def _on_redirect(auth_url):
@@ -339,7 +432,6 @@ class McpManager:
                 }
 
             provider = build_provider(server_id, url, on_redirect=_on_redirect)
-            stack = AsyncExitStack()
             transport = await stack.enter_async_context(streamablehttp_client(url, auth=provider))
             read_stream, write_stream, _get_session_id = transport
             session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
@@ -355,7 +447,6 @@ class McpManager:
                 })
 
             self._sessions[server_id] = session
-            self._stacks[server_id] = stack
             self._tools[server_id] = tools
             self._connections[server_id] = {
                 "status": "connected", "name": name, "transport": "http",
@@ -367,15 +458,31 @@ class McpManager:
             # to invalidate the tool-prompt cache.
             self._generation += 1
             logger.info(f"MCP server connected: {name} ({server_id}) - {len(tools)} tools via http")
-            return True
+            self._connect_results[server_id] = True
+            ready.set()
+
+            # Block here for the connection's lifetime; disconnect_server()
+            # cancels this task to tear down, which raises CancelledError at
+            # this await — inside this task, so the stack's cancel scopes close
+            # cleanly in the `finally` block below.
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise
         except ImportError:
             logger.warning("MCP package not installed. Install with: pip install mcp")
             self._connections[server_id] = {"status": "error", "error": "mcp package not installed", "name": name}
-            return False
+            self._connect_results[server_id] = False
+            ready.set()
         except Exception as e:
             logger.error(f"Failed to connect HTTP MCP server {name} ({server_id}): {e}")
             self._connections[server_id] = {"status": "error", "error": str(e), "name": name}
-            return False
+            self._connect_results[server_id] = False
+            ready.set()
+        finally:
+            try:
+                await stack.aclose()
+            except Exception as e:
+                logger.warning(f"Error closing MCP server {server_id}: {e}")
 
     async def disconnect_server(self, server_id: str):
         """Disconnect from an MCP server."""
@@ -384,6 +491,14 @@ class McpManager:
         task = self._connect_tasks.pop(server_id, None)
         if task is not None and not task.done():
             task.cancel()
+            # Give the owning task a moment to run its own cleanup (stack.aclose)
+            # before we return, so an immediate reconnect doesn't race a torn-down
+            # connection still unwinding for the same server_id.
+            import asyncio
+            try:
+                await asyncio.wait_for(task, timeout=3.0)
+            except Exception:
+                pass
         try:
             from src.mcp_oauth import clear_auth_url
             clear_auth_url(server_id)
@@ -409,27 +524,70 @@ class McpManager:
         for sid in ids:
             await self.disconnect_server(sid)
 
-    async def connect_all_enabled(self):
-        """Connect to all enabled MCP servers from the database."""
+    async def connect_all_enabled(self, per_server_timeout: float = 30.0):
+        """Connect to all enabled MCP servers from the database, concurrently.
+
+        Servers connect in parallel, each under its own bounded timeout. This
+        replaces the old serial loop, which had two failure modes: a single slow
+        or blocked server (e.g. a remote OAuth server awaiting discovery, or an
+        npx cold start) starved every server after it, and the whole loop ran
+        under one startup-level timeout — so when that fired mid-loop, servers
+        later in the list were never even attempted and silently stayed
+        disconnected. Now one server's slowness or failure can't affect the rest.
+        """
+        import asyncio
         from src.database import McpServer, SessionLocal
 
+        # Snapshot the server specs and release the DB session before connecting,
+        # so we don't hold a session open for the duration of the connects.
         db = SessionLocal()
         try:
             servers = db.query(McpServer).filter(McpServer.is_enabled == True).all()
-            for srv in servers:
-                args = json.loads(srv.args) if srv.args else []
-                env = json.loads(srv.env) if srv.env else {}
-                await self.connect_server(
-                    server_id=srv.id,
-                    name=srv.name,
-                    transport=srv.transport,
-                    command=srv.command,
-                    args=args,
-                    env=env,
-                    url=srv.url,
-                )
+            specs = [
+                {
+                    "server_id": srv.id,
+                    "name": srv.name,
+                    "transport": srv.transport,
+                    "command": srv.command,
+                    "args": json.loads(srv.args) if srv.args else [],
+                    "env": json.loads(srv.env) if srv.env else {},
+                    "url": srv.url,
+                }
+                for srv in servers
+            ]
         finally:
             db.close()
+
+        if not specs:
+            return
+
+        async def _connect_one(spec: Dict[str, Any]) -> None:
+            try:
+                await asyncio.wait_for(
+                    self.connect_server(
+                        server_id=spec["server_id"],
+                        name=spec["name"],
+                        transport=spec["transport"],
+                        command=spec["command"],
+                        args=spec["args"],
+                        env=spec["env"],
+                        url=spec["url"],
+                    ),
+                    timeout=per_server_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"MCP server connect timed out after {per_server_timeout}s: "
+                    f"{spec['name']} ({spec['server_id']})"
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    f"MCP server connect failed: {spec['name']} ({spec['server_id']}): {e}"
+                )
+
+        await asyncio.gather(*(_connect_one(s) for s in specs))
 
     async def call_tool(self, qualified_name: str, arguments: Dict) -> Dict:
         """Call an MCP tool by its qualified name (mcp__{server_id}__{tool_name}).
@@ -449,6 +607,7 @@ class McpManager:
 
         try:
             result = await self._do_call(session, tool_name, arguments)
+            result = await self._retry_if_suspicious_empty(session, server_id, tool_name, arguments, result)
         except Exception as e:
             # Auto-reconnect for builtin servers whose subprocess may have died
             if self.is_builtin(server_id):
@@ -500,6 +659,39 @@ class McpManager:
         if images:
             result_dict["images"] = images
         return result_dict
+
+    async def _retry_if_suspicious_empty(
+        self, session, server_id: str, tool_name: str, arguments: Dict, result: Dict
+    ) -> Dict:
+        """Retry once if an HTTP-transport call reports success with no content.
+
+        The streamable-HTTP transport can drop the in-flight response body when
+        its background GET stream disconnects/reconnects mid-call (observed
+        against mcp.atlassian.com as repeated "GET stream disconnected,
+        reconnecting" log lines). That failure mode surfaces as a *successful*
+        result with empty stdout/stderr, not an exception, so callers can't tell
+        it apart from a tool that legitimately returns nothing. Only HTTP
+        transport is affected; stdio/SSE tools that genuinely return empty output
+        are unaffected since this only fires for empty+non-error+http.
+        """
+        conn = self._connections.get(server_id, {})
+        if conn.get("transport") != "http":
+            return result
+        if result.get("exit_code") != 0 or result.get("stdout") or result.get("images"):
+            return result
+
+        logger.warning(
+            f"MCP call to {server_id}::{tool_name} returned empty success; "
+            "retrying once (suspected dropped streamable-HTTP response)"
+        )
+        import asyncio
+        await asyncio.sleep(1.0)
+        try:
+            retry_result = await self._do_call(session, tool_name, arguments)
+        except Exception as e:
+            logger.warning(f"MCP retry failed for {server_id}::{tool_name}: {e}")
+            return result
+        return retry_result
 
     async def _reconnect_builtin(self, server_id: str) -> bool:
         """Tear down and reconnect a crashed builtin MCP server."""

@@ -150,6 +150,7 @@ def setup_mcp_routes(mcp_manager: McpManager):
                     "auth_url": status.get("auth_url"),
                     "has_oauth": oauth_cfg is not None,
                     "needs_oauth": needs_oauth,
+                    "needs_auth": status.get("status") == "needs_auth",
                 })
             return result
         finally:
@@ -482,8 +483,15 @@ def setup_mcp_routes(mcp_manager: McpManager):
     @router.get("/oauth/callback")
     async def oauth_callback(code: str, state: str, request: Request):
         """Handle OAuth callback. Generic MCP OAuth flows resolve via the
-        pending-state registry; Google flows fall through to the legacy path."""
-        require_admin(request)
+        pending-state registry; Google flows fall through to the legacy path.
+
+        No admin-session check for the generic path: `state` is a server-generated,
+        unguessable secret tied to a live pending Future that only an admin-initiated
+        reconnect/add could have created (see register_pending/resolve_pending in
+        src/mcp_oauth.py), so possession of it is the actual security boundary here —
+        the same trust model any OAuth redirect_uri handler uses. Requiring a session
+        cookie too broke the flow: the browser tab that lands here after bouncing
+        through the remote authorization server doesn't reliably carry it."""
         from src.mcp_oauth import resolve_pending
         if resolve_pending(state, code):
             return HTMLResponse(_oauth_result_page(
@@ -491,7 +499,9 @@ def setup_mcp_routes(mcp_manager: McpManager):
                 "The MCP server is connecting. You can close this window and return to Odysseus.",
                 success=True,
             ))
-        # Legacy Google path: state is the server_id
+        # Legacy Google path: state is the server_id, and this path DOES mutate
+        # server config from unauthenticated input, so it keeps the admin check.
+        require_admin(request)
         return await _exchange_and_connect(state, code, request)
 
     @router.post("/oauth/exchange/{server_id}")
