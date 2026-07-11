@@ -122,7 +122,12 @@ class Session(TimestampMixin, Base):
 
     # Organization
     folder = Column(String, nullable=True, default=None)
-    
+    # Project membership (Projects feature). Nullable — a session may belong to
+    # no project. ON DELETE SET NULL is enforced at the application layer (the
+    # project-delete path nulls this) as well as declared here for fresh DBs;
+    # see specs/projects-feature-design.md and _migrate_add_project_id_to_sessions.
+    project_id = Column(String, ForeignKey("projects.id", ondelete="SET NULL"), nullable=True, index=True)
+
     # Headers stored as JSON
     headers = Column(JSON, default=dict)
 
@@ -180,9 +185,47 @@ class Session(TimestampMixin, Base):
             'message_count': self.message_count,
             'is_important': self.is_important,
             'folder': self.folder,
+            'project_id': self.project_id,
             'total_input_tokens': self.total_input_tokens or 0,
             'total_output_tokens': self.total_output_tokens or 0,
             'crew_member_id': self.crew_member_id,
+        }
+
+
+class Project(TimestampMixin, Base):
+    """Groups chat sessions (and, in later phases, documents, memories, notes,
+    and attachments) under one shared goal.
+
+    Carries the readable, auto-grown ``knowledge`` doc that is injected into
+    member sessions, plus the ``goal`` charter. Soft-archived first
+    (``archived`` / ``archived_at``); a retention sweep synthesizes durable
+    knowledge into user memories/skills before hard-deleting only this row —
+    member sessions/documents survive via ON DELETE SET NULL.
+    See specs/projects-feature-design.md.
+    """
+    __tablename__ = "projects"
+
+    id          = Column(String, primary_key=True, index=True)
+    owner       = Column(String, nullable=True, index=True)
+    name        = Column(String, nullable=False)
+    description = Column(Text, default="")
+    goal        = Column(Text, nullable=True)      # the charter — always injected
+    knowledge   = Column(Text, default="")         # readable, auto-grown knowledge doc
+    archived    = Column(Boolean, default=False, index=True)
+    archived_at = Column(DateTime, nullable=True)  # set when archived; drives 30-day retention sweep
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'owner': self.owner,
+            'name': self.name,
+            'description': self.description or "",
+            'goal': self.goal,
+            'knowledge': self.knowledge or "",
+            'archived': bool(self.archived),
+            'archived_at': self.archived_at.isoformat() if self.archived_at else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
 
 
@@ -1412,6 +1455,37 @@ def _migrate_add_folder_column():
         except Exception:
             pass
 
+def _migrate_add_project_id_to_sessions():
+    """Add the project_id membership column (+ index) to sessions if missing.
+
+    The `projects` table itself is created by create_all(); this ALTER adds
+    the FK column to the pre-existing sessions table (create_all never alters
+    existing tables). The raw ALTER adds a plain column — SQLite can't retro-add
+    an enforced inline FK — while the ORM model declares the ForeignKey for
+    fresh DBs. ON DELETE SET NULL behavior is guaranteed at the application
+    layer (the project-delete path nulls project_id) regardless.
+    """
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()]
+        if columns and "project_id" not in columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN project_id VARCHAR")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_sessions_project_id ON sessions(project_id)")
+            conn.commit()
+            logging.getLogger(__name__).info("Migrated: added 'project_id' column to sessions")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Migration check for project_id failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 def _migrate_add_token_columns():
     """Add cumulative token tracking columns to sessions table."""
     import sqlite3
@@ -2328,6 +2402,7 @@ def init_db():
     _migrate_add_document_archived_column()
     _migrate_add_last_message_at_column()
     _migrate_add_folder_column()
+    _migrate_add_project_id_to_sessions()
     _migrate_add_token_columns()
     _migrate_add_mode_column()
     _migrate_add_multiuser_owner_columns()
