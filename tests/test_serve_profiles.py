@@ -7,7 +7,7 @@ sane Quality/Balanced/Speed flag sets: a too-big MoE offloads experts to CPU
 profile intent.
 """
 
-from services.hwfit.profiles import compute_serve_profiles
+from services.hwfit.profiles import compute_serve_profiles, recommend_context
 
 _QWEN_35B_MOE = {
     "name": "Qwen3.6-35B-A3B",
@@ -102,6 +102,60 @@ def test_small_context_model_still_gets_profiles():
 def test_no_gpu_returns_empty():
     """No VRAM detected → no GPU profiles (caller falls back to manual flags)."""
     assert compute_serve_profiles({"backend": "cpu_x86", "gpu_vram_gb": 0}, _QWEN_35B_MOE) == []
+
+
+# --- recommend_context: per-model context suggestion --------------------------
+
+_DENSE_7B = {
+    "name": "qwen2.5:7b", "context_length": 32768, "block_count": 28,
+    "embedding_length": 3584, "head_count": 28, "head_count_kv": 4, "is_moe": False,
+}
+
+
+def test_recommend_context_cpu_shared_memory_is_comfortable_not_max():
+    """On a shared-memory box with no detected GPU (e.g. an Intel Arc iGPU), a
+    7B model should get a comfortable interactive context — not the full trained
+    window (which is what freezes the machine) and not a starved 2048."""
+    system = {"gpu_vram_gb": 0, "available_ram_gb": 14.0, "total_ram_gb": 20.0}
+    r = recommend_context(system, _DENSE_7B, weights_gb=4.4)
+    assert r["basis"] == "cpu_ram"
+    assert r["model_max"] == 32768
+    assert 4096 <= r["recommended"] <= 16384
+    assert r["recommended"] <= r["model_max"]
+
+
+def test_recommend_context_never_exceeds_model_max():
+    """A tiny trained window must cap the recommendation."""
+    small = dict(_DENSE_7B, context_length=4096)
+    r = recommend_context({"gpu_vram_gb": 0, "available_ram_gb": 32.0}, small, weights_gb=4.4)
+    assert r["recommended"] <= 4096
+
+
+def test_recommend_context_tight_ram_floors_at_2048():
+    """When weights barely fit, the recommendation floors at 2048 rather than
+    proposing a context the box can't hold."""
+    r = recommend_context({"gpu_vram_gb": 0, "available_ram_gb": 5.0}, _DENSE_7B, weights_gb=4.4)
+    assert r["recommended"] == 2048
+
+
+def test_recommend_context_discrete_gpu_uses_profile_path():
+    """A real discrete GPU routes through compute_serve_profiles (basis=gpu)."""
+    r = recommend_context({"gpu_vram_gb": 24.0, "available_ram_gb": 32.0}, _DENSE_7B, weights_gb=4.4)
+    assert r["basis"] == "gpu"
+    assert r["recommended"] <= r["model_max"]
+
+
+def test_recommend_context_unified_memory_uses_budget_path():
+    """Apple/APU unified memory shares the RAM pool, so it must use the memory
+    budget path, not the discrete-VRAM profiler."""
+    system = {"gpu_vram_gb": 16.0, "unified_memory": True, "available_ram_gb": 16.0}
+    r = recommend_context(system, _DENSE_7B, weights_gb=4.4)
+    assert r["basis"] == "unified"
+
+
+def test_recommend_context_bad_input_returns_none():
+    assert recommend_context(None, _DENSE_7B) is None
+    assert recommend_context({"gpu_vram_gb": 0, "available_ram_gb": 0, "total_ram_gb": 0}, _DENSE_7B) is None
 
 
 def test_vision_model_leaves_encoder_headroom():

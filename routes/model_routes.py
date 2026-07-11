@@ -858,6 +858,10 @@ def _probe_endpoint(base_url: str, api_key: str = None, timeout: int = 5) -> Lis
     from src.llm_core import httpx_get_kimi_aware
     base = resolve_url(_normalize_base(base_url))
     provider = _safe_detect_provider(base)
+    if provider == "claude-cli":
+        # No HTTP surface to probe — the CLI backend has a fixed model list.
+        from src.llm_core import CLAUDE_CLI_MODELS
+        return list(CLAUDE_CLI_MODELS)
     if provider == "chatgpt-subscription":
         from src.chatgpt_subscription import fetch_available_models
         if api_key:
@@ -2169,12 +2173,19 @@ def setup_model_routes(model_discovery):
                     response.headers["X-Model-Refresh-Warning"] = "Model refresh failed or returned no models; kept cached models."
             pinned = _normalize_model_ids(getattr(ep, "pinned_models", None))
             pinned_set = set(pinned)
+            try:
+                overrides = json.loads(ep.model_context_overrides) if ep.model_context_overrides else {}
+            except (TypeError, ValueError):
+                overrides = {}
+            if not isinstance(overrides, dict):
+                overrides = {}
             return [
                 {
                     "id": m,
                     "display": m.split("/")[-1],
                     "is_hidden": m in hidden,
                     "is_pinned": m in pinned_set,
+                    "context_override": overrides.get(m),
                 }
                 for m in _merge_model_ids(all_models, pinned)
             ]
@@ -2208,11 +2219,128 @@ def setup_model_routes(model_discovery):
             if "pinned_models" in body or "pinned" in body:
                 pinned = _normalize_model_ids(body.get("pinned_models", body.get("pinned")))
                 ep.pinned_models = json.dumps(pinned) if pinned else None
+            # Per-model context overrides: merge {model_id: ctx}. A value <= 0 or
+            # null removes the override (reverts that model to auto-detection).
+            if "context_overrides" in body:
+                incoming = body.get("context_overrides")
+                if not isinstance(incoming, dict):
+                    raise HTTPException(400, "context_overrides must be an object of {model_id: context}")
+                try:
+                    current = json.loads(ep.model_context_overrides) if ep.model_context_overrides else {}
+                except (TypeError, ValueError):
+                    current = {}
+                if not isinstance(current, dict):
+                    current = {}
+                for mid, val in incoming.items():
+                    if val in (None, 0, "", False):
+                        current.pop(mid, None)
+                        continue
+                    try:
+                        ctx_val = int(val)
+                    except (TypeError, ValueError):
+                        raise HTTPException(400, f"context override for {mid} must be an integer")
+                    if ctx_val <= 0:
+                        current.pop(mid, None)
+                    else:
+                        current[mid] = ctx_val
+                ep.model_context_overrides = json.dumps(current) if current else None
             db.commit()
             _invalidate_models_cache()
+            try:
+                from src.model_context import invalidate_context_overrides
+                invalidate_context_overrides()
+            except Exception:
+                pass
             hidden_count = len(json.loads(ep.hidden_models)) if ep.hidden_models else 0
             pinned_count = len(json.loads(ep.pinned_models)) if ep.pinned_models else 0
             return {"id": ep_id, "hidden_count": hidden_count, "pinned_count": pinned_count}
+        finally:
+            db.close()
+
+    @router.get("/model-endpoints/{ep_id}/model-context")
+    def recommend_model_context(ep_id: str, request: Request, model: str = Query(...)):
+        """Recommend a context window for `model` on this hardware, plus the model's
+        trained max and the current override. Powers the per-model context hint.
+
+        Only meaningful for local Ollama endpoints (num_ctx is Ollama-specific);
+        for other endpoints it returns applicable=false so the UI can hide the input.
+        """
+        import httpx
+        require_admin(request)
+        db = SessionLocal()
+        try:
+            ep = db.query(ModelEndpoint).filter(ModelEndpoint.id == ep_id).first()
+            if not ep:
+                raise HTTPException(404, "Endpoint not found")
+            base = _normalize_base(ep.base_url)
+            try:
+                overrides = json.loads(ep.model_context_overrides) if ep.model_context_overrides else {}
+            except (TypeError, ValueError):
+                overrides = {}
+            current_override = overrides.get(model) if isinstance(overrides, dict) else None
+
+            kind = _effective_endpoint_kind(ep, base)
+            is_ollama = (":11434" in base) or (kind == "local")
+            if not is_ollama:
+                return {"applicable": False, "current_override": current_override,
+                        "note": "Context override applies only to local Ollama endpoints."}
+
+            root = base.rstrip("/")
+            if root.endswith("/v1"):
+                root = root[:-3].rstrip("/")
+
+            # Architecture dims from /api/show (KV-cache math + trained max).
+            model_meta = {}
+            try:
+                r = httpx.post(f"{root}/api/show", json={"model": model}, timeout=8)
+                if r.is_success:
+                    info = (r.json() or {}).get("model_info") or {}
+                    def _pick(*suffixes):
+                        for k, v in info.items():
+                            if any(k.endswith(s) for s in suffixes) and isinstance(v, (int, float)) and v > 0:
+                                return int(v)
+                        return None
+                    model_meta = {
+                        "name": model,
+                        "context_length": _pick(".context_length"),
+                        "block_count": _pick(".block_count"),
+                        "embedding_length": _pick(".embedding_length"),
+                        "head_count": _pick(".attention.head_count"),
+                        "head_count_kv": _pick(".attention.head_count_kv"),
+                        "is_moe": _pick(".expert_count") not in (None, 0),
+                    }
+            except Exception as exc:
+                logger.debug("api/show failed for %s: %s", model, exc)
+
+            # On-disk size (real weights footprint) from /api/tags.
+            weights_gb = None
+            try:
+                r = httpx.get(f"{root}/api/tags", timeout=8)
+                if r.is_success:
+                    for m in (r.json() or {}).get("models", []):
+                        if m.get("name") == model or m.get("model") == model:
+                            sz = m.get("size")
+                            if isinstance(sz, (int, float)) and sz > 0:
+                                weights_gb = sz / 1e9
+                            break
+            except Exception as exc:
+                logger.debug("api/tags failed for %s: %s", model, exc)
+
+            from services.hwfit.hardware import detect_system
+            from services.hwfit.profiles import recommend_context
+            try:
+                system = detect_system()
+            except Exception as exc:
+                logger.debug("detect_system failed: %s", exc)
+                system = {}
+            reco = recommend_context(system, model_meta, weights_gb=weights_gb)
+            return {
+                "applicable": True,
+                "current_override": current_override,
+                "recommended": (reco or {}).get("recommended"),
+                "model_max": (reco or {}).get("model_max"),
+                "basis": (reco or {}).get("basis"),
+            }
         finally:
             db.close()
 

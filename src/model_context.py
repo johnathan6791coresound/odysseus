@@ -8,6 +8,7 @@ Provides token estimation for context usage tracking.
 import ipaddress
 import logging
 import sys
+import time
 from typing import Dict, List, Optional, Tuple
 
 from urllib.parse import urlparse
@@ -87,6 +88,64 @@ def _configured_endpoint_kind(url: str) -> Optional[str]:
         return None
 
 
+# Per-model context overrides are read on every request, so cache the
+# (base, model) -> override map briefly. A short TTL keeps a UI change visible
+# within seconds; `invalidate_context_overrides()` clears it immediately when
+# the endpoint is patched.
+_override_cache: Dict[Tuple[str, str], Tuple[float, Optional[int]]] = {}
+_OVERRIDE_TTL = 3.0
+
+
+def invalidate_context_overrides() -> None:
+    """Drop the per-model context-override cache (call after an endpoint PATCH)."""
+    _override_cache.clear()
+
+
+def _model_context_override(endpoint_url: str, model: str) -> Optional[int]:
+    """Return the admin-set context override for `model` on the endpoint serving
+    `endpoint_url`, or None when unset. Matches the endpoint the same way as
+    ``_configured_endpoint_kind`` (normalized base-URL prefix)."""
+    target = _normalize_base_for_compare(endpoint_url)
+    if not target:
+        return None
+    cache_key = (target, model)
+    now = time.time()
+    cached = _override_cache.get(cache_key)
+    if cached and (now - cached[0]) < _OVERRIDE_TTL:
+        return cached[1]
+
+    result: Optional[int] = None
+    if "core.database" in sys.modules:
+        try:
+            import json
+            from core.database import SessionLocal, ModelEndpoint
+            db = SessionLocal()
+            try:
+                rows = db.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True).all()
+                for ep in rows:
+                    base = _normalize_base_for_compare(getattr(ep, "base_url", "") or "")
+                    if not base or (target != base and not target.startswith(base + "/")):
+                        continue
+                    raw = getattr(ep, "model_context_overrides", None)
+                    if not raw:
+                        break
+                    try:
+                        overrides = json.loads(raw)
+                    except (TypeError, ValueError):
+                        break
+                    val = overrides.get(model) if isinstance(overrides, dict) else None
+                    if isinstance(val, (int, float)) and val > 0:
+                        result = int(val)
+                    break
+            finally:
+                db.close()
+        except Exception:
+            result = None
+
+    _override_cache[cache_key] = (now, result)
+    return result
+
+
 def is_local_endpoint(url: str) -> bool:
     """Check if URL points to a local/private/tailscale address."""
     kind = _configured_endpoint_kind(url)
@@ -122,6 +181,20 @@ KNOWN_CONTEXT_WINDOWS = {
     'claude-3-opus': 200000,
     'claude-3-sonnet': 200000,
     'claude-3-haiku': 200000,
+
+    # --- Claude Code CLI aliases (bare, unresolved snapshot names) ---
+    'sonnet': 200000,
+    'opus': 200000,
+    'haiku': 200000,
+    'fable': 200000,
+
+    # --- Meta Llama ---
+    'llama-3.2': 128000,
+    'llama3.2': 128000,
+    'llama-3.1': 128000,
+    'llama3.1': 128000,
+    # --- Google Gemma (hyphen-less tags, e.g. docker/ollama custom names) ---
+    'gemma3': 128000,
 
     # --- OpenAI ---
     'gpt-5': 400000,
@@ -164,6 +237,7 @@ KNOWN_CONTEXT_WINDOWS = {
     'mistral-small': 32000,
     'mistral-nemo': 128000,
     'mistral-7b': 32000,
+    'mistral': 32000,  # generic fallback for custom-named/unversioned tags
     'mixtral': 32000,
     'codestral': 32000,
     'pixtral': 128000,
@@ -264,10 +338,15 @@ def _get_context_length_cached(endpoint_url: str, model: str) -> Tuple[int, bool
 def get_context_length(endpoint_url: str, model: str) -> int:
     """Get the context window size for a model.
 
-    Queries /v1/models on the endpoint and looks for context_length
-    or context_window fields. Caches result per (endpoint, model).
-    Falls back to DEFAULT_CONTEXT if unavailable.
+    An admin-set per-model override (see model_endpoints.model_context_overrides)
+    takes precedence. Otherwise queries /v1/models on the endpoint and looks for
+    context_length or context_window fields, caches result per (endpoint, model),
+    and falls back to DEFAULT_CONTEXT if unavailable.
     """
+    override = _model_context_override(endpoint_url, model)
+    if override is not None:
+        logger.info(f"Using context override for {model}: {override}")
+        return override
     return _get_context_length_cached(endpoint_url, model)[0]
 
 

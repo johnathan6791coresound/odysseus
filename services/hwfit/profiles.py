@@ -236,3 +236,88 @@ def compute_serve_profiles(system, model, serve_weights_gb=None, serve_quant=Non
         seen.add(sig)
         deduped.append(p)
     return deduped
+
+
+def _model_ctx_max(model):
+    """The model's trained context limit, or a conservative default."""
+    for k in ("context_length", "max_position_embeddings", "n_ctx_train", "context"):
+        v = model.get(k)
+        if isinstance(v, (int, float)) and v > 0:
+            return int(v)
+    return 131072
+
+
+def _kv_gb_from_dims(model, ctx):
+    """Precise f16 KV-cache size (GB) from architecture dims, or None if unknown.
+
+    KV bytes = 2 (K+V) * n_layers * ctx * n_kv_heads * head_dim * 2 (f16).
+    Ollama serves an f16 KV cache by default, so this matches its real footprint.
+    """
+    emb = model.get("embedding_length") or model.get("hidden_size")
+    n_head = model.get("head_count") or model.get("num_attention_heads")
+    n_kv = (model.get("head_count_kv") or model.get("num_key_value_heads") or n_head)
+    n_layers = _n_layers(model)
+    if not (emb and n_head and n_kv and n_layers):
+        return None
+    head_dim = emb / n_head
+    kv_bytes = 2 * n_layers * ctx * n_kv * head_dim * 2
+    return kv_bytes / 1e9
+
+
+def recommend_context(system, model, weights_gb=None, reserve_gb=3.0, ceiling=16384):
+    """Recommend a context window (num_ctx) for running `model` on `system`.
+
+    Returns {"recommended": int, "model_max": int, "basis": str} or None when the
+    inputs are unusable.
+
+    - GPU path (discrete VRAM detected): reuse compute_serve_profiles and take the
+      Balanced profile's context — it already caps at the model's trained limit.
+    - CPU / unified-memory / undetected-iGPU path: pick the largest power-of-two
+      context (<= trained max, <= `ceiling`, floored at 2048) whose weights + f16
+      KV cache fit in available RAM after a `reserve_gb` headroom (OS + Odysseus
+      stack + shared-memory GPU compute buffers). This is the branch that fires on
+      shared-memory machines (e.g. an Intel Arc iGPU the GPU detector doesn't
+      report), where over-asking for context is what freezes the box. The ceiling
+      keeps the *recommendation* at a comfortable interactive size even when far
+      more would fit — the user can always set a higher value by hand.
+    """
+    if not isinstance(system, dict) or not isinstance(model, dict):
+        return None
+
+    model_max = _model_ctx_max(model)
+
+    vram = float(system.get("gpu_vram_gb") or 0)
+    unified = bool(system.get("unified_memory"))
+    # Discrete VRAM only — a unified-memory "GPU" (Apple/APU) shares the RAM pool,
+    # so treat it via the memory-budget path below, not the VRAM profiler.
+    if vram > 0 and not unified:
+        profs = compute_serve_profiles(system, model, serve_weights_gb=weights_gb)
+        if profs:
+            chosen = next((p for p in profs if p["key"] == "balanced"), profs[0])
+            return {"recommended": int(chosen["ctx"]), "model_max": model_max, "basis": "gpu"}
+
+    # Memory-budget path (CPU / unified / undetected GPU).
+    avail = float(system.get("available_ram_gb") or 0)
+    if avail <= 0:
+        avail = float(system.get("total_ram_gb") or 0) * 0.7
+    if avail <= 0:
+        return None
+
+    weights = float(weights_gb) if (weights_gb and weights_gb > 0) else _weights_gb(model, "Q4_K_M")
+    # Leave headroom for the OS, the Odysseus stack, and (on shared-memory GPUs)
+    # the compute buffers that draw from the same RAM pool.
+    reserve = max(reserve_gb, avail * 0.2)
+    kv_budget = (avail - reserve) - weights
+
+    upper = min(model_max, ceiling)
+    ctx = 2048
+    while ctx * 2 <= upper:
+        ctx *= 2
+    while ctx > 2048:
+        kv = _kv_gb_from_dims(model, ctx)
+        if kv is None:
+            kv = _kv_gb(model, ctx, "f16")
+        if kv <= kv_budget:
+            break
+        ctx //= 2
+    return {"recommended": int(ctx), "model_max": model_max, "basis": "unified" if unified else "cpu_ram"}
