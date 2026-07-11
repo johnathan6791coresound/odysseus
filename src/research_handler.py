@@ -161,6 +161,7 @@ class ResearchHandler:
                 headers=llm_headers,
                 timeout=15,
                 max_retries=1,
+                role="research",
             )
             query = strip_thinking(response).strip().strip('"\'')
             if query and len(query) > 5:
@@ -188,6 +189,7 @@ class ResearchHandler:
                 headers=llm_headers,
                 timeout=30,
                 max_retries=1,
+                role="research",
             )
             response = strip_thinking(response)
 
@@ -731,6 +733,7 @@ class ResearchHandler:
                 headers=headers,
                 timeout=15,
                 max_retries=1,
+                role="research",
             )
             logger.info(f"Endpoint probe OK: {model}")
         except Exception as e:

@@ -556,6 +556,9 @@ def setup_chat_routes(
         # actually get bash enabled.
         allow_bash = form_data.get("allow_bash") or (body or {}).get("allow_bash")
         allow_web_search = form_data.get("allow_web_search") or (body or {}).get("allow_web_search")
+        # Per-message reasoning-effort override for the Claude Code CLI backend
+        # (--effort low/medium/high/xhigh/max). Ignored by every other provider.
+        claude_cli_effort = form_data.get("claude_cli_effort") or (body or {}).get("claude_cli_effort")
         use_rag = form_data.get("use_rag")
         search_context = form_data.get("search_context")  # pre-fetched web search results (compare mode)
         compare_mode = str(form_data.get("compare_mode", "")).lower() == "true"
@@ -882,6 +885,7 @@ def setup_chat_routes(
         ):
             disabled_tools.add("web_search")
             disabled_tools.add("web_fetch")
+        _explicit_web_intent = bool(_tool_intent and _tool_intent.category == "web")
         if _explicit_web_intent:
             # A direct lookup/search request should not drift into personal
             # tools or shell fallbacks. We still keep web_search/web_fetch
@@ -1262,6 +1266,7 @@ def setup_chat_routes(
                         prompt_type=preset_id,
                         tools=None,
                         session_id=session,
+                        claude_cli_effort=claude_cli_effort,
                     ):
                         if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                             try:
@@ -1438,6 +1443,7 @@ def setup_chat_routes(
                         workspace=workspace or None,
                         forced_tools=_forced_tools,
                         uploaded_files=ctx.uploaded_files,
+                        claude_cli_effort=claude_cli_effort,
                     ):
                         if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                             try:

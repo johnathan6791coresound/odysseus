@@ -5,6 +5,7 @@ import { providerLogo } from './providers.js';
 import uiModule from './ui.js';
 import settingsModule from './settings.js';
 import { sortModelObjects } from './modelSort.js';
+import Storage from './storage.js';
 
 const API_BASE = window.location.origin;
 
@@ -170,6 +171,61 @@ async function _ensureDefaultPendingChat() {
 export function initModelPicker(deps) {
   _deps = deps;
   _initModelPickerDropdown();
+  _initClaudeEffortSelect();
+}
+
+const _CLAUDE_EFFORT_LABELS = {
+  '': 'Auto', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'XHigh', max: 'Max',
+};
+
+// Claude Code CLI effort picker — a small button+menu matching the model
+// picker's own look/behavior (reuses .model-picker-btn/.model-picker-menu/
+// .model-switch-item), rather than a native <select>. Browser-local
+// convenience, not session state — see chat.js's FormData wiring for where
+// this value is actually sent per-message.
+function _initClaudeEffortSelect() {
+  const btn = document.getElementById('claude-effort-btn');
+  const label = document.getElementById('claude-effort-label');
+  const menu = document.getElementById('claude-effort-menu');
+  const list = document.getElementById('claude-effort-list');
+  if (!btn || !label || !menu || !list) return;
+
+  function _setValue(val) {
+    btn.dataset.value = val || '';
+    label.textContent = 'Effort: ' + (_CLAUDE_EFFORT_LABELS[val] || 'Auto');
+    list.querySelectorAll('.model-switch-item').forEach(item => {
+      item.classList.toggle('kb-active', item.dataset.effort === (val || ''));
+    });
+  }
+
+  function _close() { menu.classList.add('hidden'); }
+  function _toggle() { menu.classList.toggle('hidden'); }
+
+  try {
+    const saved = Storage.get('claude_cli_effort', '');
+    _setValue(saved);
+  } catch { _setValue(''); }
+
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    _toggle();
+  });
+  list.addEventListener('click', (e) => {
+    const item = e.target.closest('.model-switch-item');
+    if (!item) return;
+    const val = item.dataset.effort || '';
+    _setValue(val);
+    try { Storage.set('claude_cli_effort', val); } catch {}
+    _close();
+  });
+  document.addEventListener('click', (e) => {
+    if (!menu.classList.contains('hidden') && !btn.contains(e.target) && !menu.contains(e.target)) {
+      _close();
+    }
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !menu.classList.contains('hidden')) _close();
+  });
 }
 
 function _initModelPickerDropdown() {
@@ -782,6 +838,15 @@ export function updateModelPicker() {
     (!modelId || (latestPending && latestPending.source === 'fallback'))
   ) {
     _ensureDefaultPendingChat();
+  }
+
+  // Claude Code CLI effort picker — only meaningful for that backend.
+  // Settings > Appearance > Chat Area independently gates the outer
+  // #claude-effort-wrap; this only ever touches the inner picker's display.
+  const effortPickerWrap = document.getElementById('claude-effort-picker-wrap');
+  if (effortPickerWrap) {
+    const effectiveUrl = (s && s.endpoint_url) || (_pendingChat && _pendingChat.url) || '';
+    effortPickerWrap.style.display = effectiveUrl.startsWith('claude-cli://') ? '' : 'none';
   }
 
   const displayName = modelId ? modelId.split('/').pop() : 'Select model';

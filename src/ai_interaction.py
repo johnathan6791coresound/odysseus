@@ -90,6 +90,21 @@ def _resolve_model(spec: str, owner: Optional[str] = None) -> Tuple[str, str, Di
     spec = spec.strip()
     target_endpoint_name = None
 
+    # Named-role aliases for delegation tools (chat_with_model, pipeline steps,
+    # create_session): let an agent say model "utility"/"cheap"/"research"/
+    # "task"/"default" and resolve through the role system (cost auto-routing,
+    # cascades, fallbacks) instead of a literal model-name search. Matched
+    # EXACTLY (not substring) so a user's real model literally named e.g. "task"
+    # is never silently hijacked.
+    _alias = spec.lower()
+    if _alias in ("utility", "cheap", "research", "task", "default"):
+        from src.endpoint_resolver import resolve_endpoint
+        role = "utility" if _alias == "cheap" else _alias
+        url, model, headers = resolve_endpoint(role, owner=owner)
+        if url and model:
+            return url, model, headers or {}
+        raise ValueError(f"Model role '{spec}' did not resolve to a usable endpoint")
+
     if "@" in spec:
         model_name, target_endpoint_name = spec.rsplit("@", 1)
         model_name = model_name.strip()
@@ -117,6 +132,20 @@ def _resolve_model(spec: str, owner: Optional[str] = None) -> Tuple[str, str, Di
                 continue
             provider = _detect_provider(base)
             headers = build_headers(api_key, base)
+
+            if provider == "claude-cli":
+                # Claude Code CLI backend: models are tier aliases
+                # (sonnet/opus/haiku/fable), not HTTP-probeable. Return the
+                # sentinel base_url unchanged so llm_core routes the call to the
+                # `claude -p` subprocess (via _is_claude_cli_base) rather than
+                # trying to build/probe a real HTTP endpoint.
+                from src.llm_core import CLAUDE_CLI_MODELS, CLAUDE_CLI_BASE_URL
+                for cm in CLAUDE_CLI_MODELS:
+                    if (model_name.lower() == cm
+                            or model_name.lower() in cm
+                            or cm in model_name.lower()):
+                        return CLAUDE_CLI_BASE_URL, cm, headers
+                continue
 
             if provider == "anthropic":
                 # Anthropic: match against hardcoded model list
@@ -310,7 +339,37 @@ async def do_manage_memory(content: str, session_id: Optional[str] = None, owner
     if not _memory_manager:
         return {"error": "Memory manager not available"}
 
-    lines = content.strip().split("\n")
+    stripped = content.strip()
+    # Accept a JSON body too — most sibling tools advertise "Args (JSON):
+    # {...}" in the catalog, so models habitually send
+    # `{"action": "list"}` here despite this tool's line-based doc string.
+    # Without this, the raw JSON string was treated as a literal
+    # (unrecognized) action name. Normalize into the same `lines` shape
+    # the rest of this function already expects.
+    lines = None
+    if stripped.startswith("{"):
+        try:
+            parsed = json.loads(stripped)
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict) and "action" in parsed:
+            _action = str(parsed.get("action", "")).strip().lower()
+            if _action == "list":
+                lines = ["list", str(parsed["category"])] if parsed.get("category") else ["list"]
+            elif _action == "add":
+                lines = ["add", str(parsed.get("text", ""))]
+                if parsed.get("category"):
+                    lines.append(str(parsed["category"]))
+            elif _action == "edit":
+                lines = ["edit", str(parsed.get("memory_id", "")), str(parsed.get("text", ""))]
+            elif _action == "delete":
+                lines = ["delete", str(parsed.get("memory_id", ""))]
+            elif _action == "search":
+                lines = ["search", str(parsed.get("query", parsed.get("text", "")))]
+            else:
+                lines = [_action]
+    if lines is None:
+        lines = content.strip().split("\n")
     if not lines:
         return {"error": "Need at least 1 line: action"}
 

@@ -433,9 +433,9 @@ def _set_cached_response(cache_key: str, response: str) -> None:
 # ── Anthropic native API adapter ──
 
 ANTHROPIC_MODELS = [
-    "claude-opus-4-20250514", "claude-opus-4",
-    "claude-sonnet-4-20250514", "claude-sonnet-4", "claude-sonnet-4-5-20250929", "claude-sonnet-4-5",
-    "claude-haiku-4-20250514", "claude-haiku-4", "claude-haiku-3-5-20241022", "claude-haiku-3-5",
+    "claude-opus-4-8", "claude-opus-4-20250514", "claude-opus-4",
+    "claude-sonnet-5", "claude-sonnet-4-20250514", "claude-sonnet-4", "claude-sonnet-4-5-20250929", "claude-sonnet-4-5",
+    "claude-haiku-4-5-20251001", "claude-haiku-4-20250514", "claude-haiku-4", "claude-haiku-3-5-20241022", "claude-haiku-3-5",
 ]
 
 
@@ -814,6 +814,26 @@ async def httpx_post_kimi_aware_async(client, url: str, headers: Optional[Dict],
     return last
 
 
+CLAUDE_CLI_BASE_URL = "claude-cli://local"
+
+# Model *aliases* for the Claude Code CLI backend, not pinned snapshot IDs.
+# The CLI resolves these to whatever Anthropic currently ships as the latest
+# model in each tier (confirmed by asking a running CLI: `--model sonnet`
+# resolved to "claude-sonnet-5", `--model opus` to "claude-opus-4-8", etc.).
+# This means the dropdown never goes stale — Odysseus doesn't need to track
+# version strings, the CLI's own auto-updater does that.
+CLAUDE_CLI_MODELS = ["sonnet", "opus", "haiku", "fable"]
+
+
+def _is_claude_cli_base(url: str) -> bool:
+    """True for the sentinel base_url marking the Claude Code CLI backend.
+
+    This endpoint has no real HTTP address; requests are dispatched to a local
+    `claude` subprocess instead (see `_stream_claude_cli`).
+    """
+    return (url or "").strip().lower().startswith("claude-cli://")
+
+
 def _detect_provider(url: str) -> str:
     """Detect the API provider from a configured endpoint URL.
 
@@ -823,6 +843,8 @@ def _detect_provider(url: str) -> str:
     Unknown hosts fall back to the OpenAI-compatible default, which the
     majority of providers implement.
     """
+    if _is_claude_cli_base(url):
+        return "claude-cli"
     if _is_ollama_native_url(url):
         return "ollama"
     if _host_match(url, "anthropic.com"):
@@ -1767,6 +1789,13 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         logger.debug(f"Returning cached response for key: {cache_key}")
         return cached_response
 
+    if provider == "claude-cli":
+        # The CLI backend has no HTTP endpoint; dispatch to the `claude -p`
+        # subprocess (handles images via stream-json) instead of POSTing.
+        response = _run_claude_cli_sync(model, messages_copy, timeout)
+        _set_cached_response(cache_key, response)
+        return response
+
     if provider == "anthropic":
         target_url = _normalize_anthropic_url(url)
         h = _build_anthropic_headers(headers)
@@ -1903,6 +1932,8 @@ async def llm_call_async(
     prompt_type: Optional[str] = None,
     session_id: Optional[str] = None,
     workload: str = "foreground",
+    role: Optional[str] = None,
+    owner: Optional[str] = None,
 ) -> str:
     """Asynchronous LLM call using httpx with connection pooling, timeout, retry logic, and performance logging."""
     provider = _detect_provider(url)
@@ -1927,10 +1958,11 @@ async def llm_call_async(
         logger.debug(f"Returning cached response for key: {cache_key}")
         return cached_response
 
-    if provider == "chatgpt-subscription":
-        # ChatGPT/Codex requires streamed Responses requests even for callers
+    if provider in ("chatgpt-subscription", "claude-cli"):
+        # Both the ChatGPT-subscription and Claude-CLI backends only expose a
+        # streaming interface (Codex Responses SSE / claude -p stream-json).
+        # Reuse stream_llm's validated path and collect deltas for callers
         # that want a plain string (auto-title, memory extraction, etc.).
-        # Reuse stream_llm's validated Codex SSE path and collect deltas.
         parts: List[str] = []
         async for chunk in stream_llm(
             url,
@@ -1940,6 +1972,7 @@ async def llm_call_async(
             max_tokens=max_tokens,
             headers=headers,
             timeout=timeout,
+            session_id=session_id,
             workload=workload,
         ):
             event_is_error = False
@@ -2043,6 +2076,15 @@ async def llm_call_async(
                 else:
                     msg = data["choices"][0]["message"]
                     response = msg.get("content") or msg.get("reasoning_content") or ""
+                try:
+                    _inp, _out, _cr, _cw = _extract_usage_counts(provider, data)
+                    record_usage_event(
+                        session_id=session_id, role=role, provider=provider, model=model,
+                        input_tokens=_inp, output_tokens=_out,
+                        cache_read_tokens=_cr, cache_write_tokens=_cw, owner=owner,
+                    )
+                except Exception:
+                    pass
                 _set_cached_response(cache_key, response)
                 return response
             except Exception:
@@ -2062,8 +2104,582 @@ async def llm_call_async(
                 raise HTTPException(502, f"POST {target_url} failed after {max_retries} attempts: {e}")
             await asyncio.sleep(LLMConfig.RETRY_DELAY)
 
+def _flatten_messages_for_claude_cli(messages: List[Dict]) -> str:
+    """Flatten a role-tagged message list into a single transcript string.
+
+    `claude -p` takes one prompt string, not a structured messages array, so
+    prior turns are rendered as a plain role-tagged transcript — the same
+    shape Odysseus already uses for fenced-block ("non-native tool calling")
+    local models.
+    """
+    lines = []
+    for m in messages:
+        role = (m.get("role") or "user").capitalize()
+        content = m.get("content") or ""
+        if not isinstance(content, str):
+            content = json.dumps(content)
+        lines.append(f"{role}: {content}")
+    return "\n\n".join(lines)
+
+
+def _messages_have_image(messages: List[Dict]) -> bool:
+    """True if any message carries an image content block.
+
+    Text turns are flattened to a single `-p` prompt string (which preserves
+    the CLI's own prompt-caching via --resume). Image turns can't survive that
+    path — `json.dumps` would stringify the base64 into the prompt — so they're
+    routed through --input-format stream-json instead (see _stream_claude_cli).
+    """
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") in ("image", "image_url"):
+                    return True
+    return False
+
+
+def _parse_image_data_uri(url: str):
+    """Split a `data:image/...;base64,<data>` URI into (media_type, data).
+
+    Returns None for anything that isn't a base64 image data URI.
+    """
+    if not isinstance(url, str) or not url.startswith("data:"):
+        return None
+    try:
+        header, data = url.split(",", 1)
+    except ValueError:
+        return None
+    meta = header[len("data:"):]
+    media_type = (meta.split(";", 1)[0] if ";" in meta else meta) or "image/jpeg"
+    if not media_type.startswith("image/"):
+        media_type = "image/jpeg"
+    return media_type, data
+
+
+def _to_anthropic_content_block(block: Dict):
+    """Convert one message content block to the Anthropic content-block shape
+    the CLI's stream-json input expects. Returns None to drop an unusable block.
+    """
+    if not isinstance(block, dict):
+        return {"type": "text", "text": str(block)}
+    btype = block.get("type")
+    if btype == "text":
+        return {"type": "text", "text": block.get("text") or ""}
+    if btype == "image":  # already Anthropic-shaped — pass through
+        return block
+    if btype == "image_url":
+        url = ((block.get("image_url") or {}).get("url")) or ""
+        parsed = _parse_image_data_uri(url)
+        if parsed:
+            media_type, data = parsed
+            return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}
+        if url.startswith("http://") or url.startswith("https://"):
+            return {"type": "image", "source": {"type": "url", "url": url}}
+        return None
+    return None
+
+
+def _to_cli_stream_json_input(messages: List[Dict]) -> str:
+    """Serialize messages into the CLI's newline-delimited stream-json input.
+
+    The CLI's `--input-format stream-json` reads user-role messages whose
+    `content` is an Anthropic content-block array. Prior turns are folded into
+    a single user message (text turns as role-prefixed text blocks, images as
+    real image blocks) so the image reaches the model as an image rather than
+    stringified base64.
+    """
+    blocks: List[Dict] = []
+    for m in messages:
+        role = (m.get("role") or "user")
+        content = m.get("content")
+        if isinstance(content, str):
+            if content.strip():
+                prefix = "" if role == "user" else f"{role.capitalize()}: "
+                blocks.append({"type": "text", "text": prefix + content})
+            continue
+        if isinstance(content, list):
+            for block in content:
+                converted = _to_anthropic_content_block(block)
+                if converted:
+                    blocks.append(converted)
+    if not blocks:
+        blocks = [{"type": "text", "text": ""}]
+    envelope = {"type": "user", "message": {"role": "user", "content": blocks}}
+    return json.dumps(envelope) + "\n"
+
+
+# Native Claude Code tools to hard-deny for the CLI backend. Shared by the
+# streaming path (_stream_claude_cli) and the synchronous one-shot runner
+# (_run_claude_cli_sync) so the two can't drift.
+_CLAUDE_CLI_DENY_TOOLS = [
+    "Bash", "Edit", "Write", "Read", "Glob", "Grep", "Agent", "Skill",
+    "Workflow", "WebFetch", "WebSearch", "NotebookEdit", "ReportFindings",
+    "ScheduleWakeup", "ShareOnboardingGuide", "ToolSearch", "TodoWrite",
+    "TaskCreate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TaskUpdate",
+    "CronCreate", "CronDelete", "CronList", "DesignSync",
+    "EnterWorktree", "ExitWorktree", "Monitor", "PushNotification",
+    "RemoteTrigger", "SendMessage",
+]
+
+
+def _run_claude_cli_sync(model: str, messages: List[Dict], timeout: int) -> str:
+    """Run a one-shot `claude -p` synchronously and return the assistant text.
+
+    The synchronous `llm_call` path (used by the vision analyzer and other
+    non-streaming callers) can't reach the async `_stream_claude_cli`, so this
+    mirrors its invocation with a blocking subprocess. Image turns are fed as
+    Anthropic content blocks over --input-format stream-json (the only way the
+    CLI accepts an image); text turns use the flattened positional prompt.
+
+    No session/resume: these callers are one-shot (no prompt-cache continuity
+    to preserve), so the extra --resume machinery isn't needed here.
+    """
+    import subprocess
+
+    sys_parts = [
+        m.get("content") or ""
+        for m in messages
+        if m.get("role") == "system" and isinstance(m.get("content"), str)
+    ]
+    system_prompt = "\n\n".join(p for p in sys_parts if p)
+    convo = [m for m in messages if m.get("role") != "system"]
+
+    settings_json = json.dumps({"permissions": {"deny": _CLAUDE_CLI_DENY_TOOLS}})
+    cmd = ["claude", "-p"]
+    stdin_data = None
+    if _messages_have_image(convo):
+        cmd += ["--input-format", "stream-json"]
+        stdin_data = _to_cli_stream_json_input(convo).encode("utf-8")
+    else:
+        cmd += [_flatten_messages_for_claude_cli(convo)]
+    cmd += ["--output-format", "stream-json", "--verbose", "--settings", settings_json]
+    if system_prompt:
+        cmd += ["--system-prompt", system_prompt]
+    if model:
+        cmd += ["--model", model]
+
+    try:
+        proc = subprocess.run(
+            cmd, input=stdin_data,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
+        )
+    except FileNotFoundError:
+        raise HTTPException(500, "claude CLI not found in container (expected @anthropic-ai/claude-code installed globally)")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, f"claude CLI timed out after {timeout}s")
+
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", errors="replace").strip()
+        hint = " (run `claude login` inside the container if this is an authentication error)"
+        raise HTTPException(502, f"claude CLI exited {proc.returncode}: {err}{hint}")
+
+    parts: List[str] = []
+    for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "assistant":
+            text = _extract_claude_cli_text(event)
+            if text:
+                parts.append(text)
+    return "".join(parts)
+
+
+def _extract_claude_cli_text(event: Dict) -> Optional[str]:
+    """Best-effort text extraction from a Claude Code `stream-json` event.
+
+    Claude Code's stream-json event shapes have varied across CLI versions;
+    this checks the known text-bearing shapes rather than assuming one.
+    """
+    if not isinstance(event, dict):
+        return None
+    etype = event.get("type")
+    if etype == "assistant":
+        message = event.get("message") or {}
+        parts = []
+        for block in message.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text") or "")
+        if parts:
+            return "".join(parts)
+    if etype == "content_block_delta":
+        delta = event.get("delta") or {}
+        if delta.get("type") == "text_delta":
+            return delta.get("text") or ""
+    if etype == "text_delta":
+        return event.get("text") or ""
+    return None
+
+
+_CLAUDE_CLI_EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
+
+
+async def _stream_claude_cli(model: str, messages: List[Dict], timeout: int, effort: Optional[str] = None,
+                              session_id: Optional[str] = None):
+    """Stream a response from the local Claude Code CLI (`claude -p`).
+
+    Authenticates via the CLI's own `claude login` session (an Anthropic
+    subscription seat) rather than an API key — Odysseus never sees or stores
+    a token here.
+
+    Claude Code's own built-in tools are hard-disabled via `--settings`'
+    `permissions.deny` list — this is a genuine enforced gate, verified by
+    actually asking it to run `echo` with Bash denied and confirming it
+    refused ("I don't have a Bash/shell execution tool available"). Two
+    other approaches were tried and rejected first:
+      - `--allowedTools ""` is a no-op in headless `-p` mode — testing
+        proved Bash still executes even with an allowlist of just "Read".
+      - `--permission-mode plan` back-fires: "plan mode" makes the model
+        treat itself as structurally unable to produce ANY actionable
+        output, including plain fenced-block text, since it believes it
+        needs approval to "execute" anything at all.
+    An explicit instruction (below) telling the model to use Odysseus's
+    fenced-block convention instead is kept as defense-in-depth on top of
+    the real deny-list gate, not as the only protection.
+
+    `effort` is an optional per-message reasoning-effort override (low/medium/
+    high/xhigh/max), mapped to the CLI's own `--effort` flag. Left unset, the
+    CLI uses its own default.
+
+    `session_id` is Odysseus's own chat session id (already a UUID — see
+    `routes/session_routes.py`), reused verbatim as the CLI's own
+    `--session-id`/`--resume` identifier so a single Odysseus chat maps to
+    one continuing CLI session instead of restarting from scratch every
+    turn. Without this, `_flatten_messages_for_claude_cli` re-sent the whole
+    growing transcript as a fresh prompt on every call, so Anthropic's
+    prompt caching never applied and later turns were billed as if every
+    prior message were brand new. On the first turn for a session (no prior
+    assistant message yet) we pass `--session-id <id>` with the full
+    (single-message) prompt; on later turns we pass `--resume <id>` with
+    only the newest message(s) since the last assistant turn — the CLI
+    loads the rest of the transcript itself from its own on-disk session
+    store. If `--resume` fails outright (e.g. the container was recreated
+    and the CLI's local session store is gone), we fall back once to
+    resending the full flattened transcript under `--session-id` so the
+    turn still succeeds, just without continuity.
+
+    Yields the same SSE chunk shapes as `_stream_llm_inner`.
+    """
+    sys_parts = [m.get("content") or "" for m in messages if m.get("role") == "system"]
+    system_prompt = "\n\n".join(p for p in sys_parts if p)
+    convo = [m for m in messages if m.get("role") != "system"]
+
+    has_prior_turn = any(m.get("role") == "assistant" for m in convo)
+    resuming = bool(session_id) and has_prior_turn
+    if resuming:
+        last_assistant_idx = max(i for i, m in enumerate(convo) if m.get("role") == "assistant")
+        new_turn = convo[last_assistant_idx + 1:]
+        prompt = _flatten_messages_for_claude_cli(new_turn) if new_turn else ""
+    else:
+        prompt = _flatten_messages_for_claude_cli(convo)
+
+    _no_native_tools_notice = (
+        "You are being driven as a text-generation backend for a separate "
+        "agent harness (Odysseus), not as Claude Code's own interactive "
+        "agent. Do NOT attempt to invoke Bash, Edit, Write, Read, or any "
+        "other native Claude Code tool — you do not have real access to "
+        "them here and trying will only stall waiting on a permission "
+        "prompt nobody can answer. Instead, follow the tool-use "
+        "instructions given below exactly, using inline fenced code "
+        "blocks — the harness executes those for you.\n\n"
+        "IMPORTANT — the harness's tool schemas are NOT the same as your "
+        "native Claude Code tool schemas, even for similarly-named tools. "
+        "In particular, `edit_file` here takes a JSON object with key "
+        "`path` (not `file_path` — that's your native Edit tool's field "
+        "name and will fail here). Use exactly the field names shown in "
+        "each tool's fenced-block example below, not the equivalent "
+        "native-tool schema from memory.\n\n"
+        "CONCRETE EXAMPLE — this is what a real tool call looks like here, "
+        "and it is the ONLY thing that actually executes. Writing prose "
+        "that merely resembles a shell command (e.g. a ```bash block "
+        "containing `echo \"loading tool\"`) does nothing — no code you "
+        "write is ever actually run unless the fence's language tag is "
+        "an exact tool name from the catalog below, e.g.:\n\n"
+        "```load_tools\n"
+        "{\"names\": [\"manage_memory\"]}\n"
+        "```\n\n"
+        "That fence, written exactly like that with `load_tools` as the "
+        "language tag and a JSON object as the body, is a REAL tool call "
+        "the harness intercepts and executes — you will see its result "
+        "appended right after. `bash` and `python` tool names below refer "
+        "to the HARNESS's own sandboxed tools, invoked the same fenced way "
+        "(```bash\\n<command>\\n```), not your native Bash/code-execution "
+        "capability — you have none here. If you are ever unsure whether "
+        "a tool is 'really' available, the answer is: if its exact name "
+        "appears in the tool catalog or rules below, write the fenced "
+        "block and it WILL execute for real. Do not guess, hedge, or "
+        "tell the user tools are unavailable without first trying the "
+        "exact fenced-block call for the tool name you need."
+    )
+    if session_id:
+        # We already know this UUID -- it's the same value passed as
+        # --session-id/--resume below -- so tell the model directly rather
+        # than leaving it unable to answer "what's your session id" (it has
+        # no tool access to introspect the CLI process itself, since every
+        # native tool is denied below).
+        _no_native_tools_notice += (
+            "\n\nThis conversation's Claude Code CLI session id is "
+            f"{session_id}. Odysseus resumes this exact CLI session on every "
+            "turn via `claude --resume` (only your newest message is sent "
+            "each turn; this harness reloads the rest from the CLI's own "
+            "on-disk session state) — you are not being re-fed the full "
+            "transcript as a fresh prompt each time."
+        )
+
+    # Explicit deny list — verified as a real enforced gate (unlike
+    # --allowedTools). No wildcard form works ("*" was tested and does not
+    # deny anything), so every native tool name observed via self-report
+    # across CLI versions is listed individually. If Anthropic adds new
+    # built-in tools this list can lag; the system-prompt instruction below
+    # is the defense-in-depth for that gap.
+    _deny_tools = _CLAUDE_CLI_DENY_TOOLS
+    _settings_json = json.dumps({"permissions": {"deny": _deny_tools}})
+
+    def _build_cmd(prompt_text: str, *, resume: bool, stream_json_input: bool = False) -> List[str]:
+        # Image turns pass structured messages (with real image blocks) on stdin
+        # via --input-format stream-json; text turns pass the flattened prompt as
+        # the positional `-p` argument (the default, cache-friendly path).
+        c = ["claude", "-p"]
+        if stream_json_input:
+            c += ["--input-format", "stream-json"]
+        else:
+            c += [prompt_text]
+        c += [
+            "--output-format", "stream-json",
+            "--verbose",
+            "--settings", _settings_json,
+        ]
+        # --system-prompt REPLACES Claude Code's default system prompt (unlike
+        # --append-system-prompt, which layers Odysseus's instructions on top of
+        # Claude Code's own default framing and caused a different
+        # self-referential confusion — see git history for that attempt). Always
+        # included, even with no Odysseus system prompt, since the notice itself
+        # must always override Claude Code's default framing.
+        c += ["--system-prompt", (_no_native_tools_notice + "\n\n" + system_prompt) if system_prompt else _no_native_tools_notice]
+        if model:
+            c += ["--model", model]
+        _effort = (effort or "").strip().lower()
+        if _effort in _CLAUDE_CLI_EFFORT_LEVELS:
+            c += ["--effort", _effort]
+        if session_id:
+            c += (["--resume", session_id] if resume else ["--session-id", session_id])
+        return c
+
+    async def _run(cmd: List[str], stdin_data: Optional[bytes] = None):
+        """Run one `claude -p` invocation.
+
+        Yields SSE chunk strings, then finally yields a single
+        `(returncode, emitted_any, err_text)` tuple so the caller can decide
+        whether a `--resume` failure is safe to retry without --resume.
+        (An async generator's `return` value isn't visible to `async for`,
+        so the result has to be yielded, not returned.)
+
+        `stdin_data`, when set, is written to the process's stdin and the pipe
+        is closed — used to feed --input-format stream-json image turns.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=(asyncio.subprocess.PIPE if stdin_data is not None else None),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            yield f'event: error\ndata: {json.dumps({"error": "claude CLI not found in container (expected @anthropic-ai/claude-code installed globally)", "status": 500})}\n\n'
+            yield (500, False, "claude CLI not found")
+            return
+
+        if stdin_data is not None:
+            try:
+                proc.stdin.write(stdin_data)
+                await proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                proc.stdin.close()
+
+        emitted_any = False
+        try:
+            async def _read_lines():
+                async for raw_line in proc.stdout:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if event.get("type") == "result" and not event.get("is_error"):
+                        # The CLI's own reported token accounting for this
+                        # turn. `cache_read_input_tokens` being large and
+                        # nonzero is the actual proof prompt caching is
+                        # working -- if this were still flattening the full
+                        # transcript fresh every turn there'd be nothing to
+                        # read from cache. Log it so it's independently
+                        # observable per real turn without extra probing.
+                        #
+                        # Gated on `not is_error`: an error result (e.g. the
+                        # `--resume` target doesn't exist) still carries a
+                        # "result" event with all-zero usage, and yielding a
+                        # chunk for it would mark `emitted_any` True below --
+                        # which would wrongly suppress the --resume-failed
+                        # fallback a few lines down (it retries only when
+                        # nothing at all was emitted). A failed call has no
+                        # real usage worth showing anyway.
+                        usage = event.get("usage") or {}
+                        logger.info(
+                            "[claude-cli-session] session_id=%s usage: input=%s "
+                            "cache_read=%s cache_creation=%s output=%s cost_usd=%s",
+                            session_id,
+                            usage.get("input_tokens"),
+                            usage.get("cache_read_input_tokens"),
+                            usage.get("cache_creation_input_tokens"),
+                            usage.get("output_tokens"),
+                            event.get("total_cost_usd"),
+                        )
+                        # Surface the same figures to the chat UI's metrics
+                        # card via the generic "usage" SSE event agent_loop.py
+                        # already consumes for every provider.
+                        _usage_payload = {
+                            "input_tokens": usage.get("input_tokens", 0) or 0,
+                            "output_tokens": usage.get("output_tokens", 0) or 0,
+                            "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0) or 0,
+                            "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0) or 0,
+                            "total_cost_usd": event.get("total_cost_usd") or 0,
+                        }
+                        yield f'data: {json.dumps({"type": "usage", "data": _usage_payload})}\n\n'
+                    text = _extract_claude_cli_text(event)
+                    if text:
+                        yield f'data: {json.dumps({"delta": text})}\n\n'
+
+            async for chunk in _stream_with_timeout(_read_lines(), timeout):
+                emitted_any = True
+                yield chunk
+
+            stderr_bytes = await proc.stderr.read()
+            returncode = await proc.wait()
+            if returncode != 0:
+                err_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+                yield (returncode, emitted_any, err_text)
+            else:
+                yield (0, emitted_any, "")
+        except asyncio.CancelledError:
+            proc.kill()
+            raise
+        finally:
+            if proc.returncode is None:
+                proc.kill()
+
+    logger.info(
+        "[claude-cli-session] session_id=%s mode=%s prompt_chars=%d",
+        session_id, ("resume" if resuming else "new-session-id"), len(prompt),
+    )
+
+    # Image turns can't ride the flattened positional-prompt path (base64 would
+    # be stringified into the prompt). Feed the message — with real image blocks
+    # — through --input-format stream-json on stdin instead. Only the newest
+    # turn is sent when resuming, matching the text path's caching contract.
+    if _messages_have_image(convo):
+        if resuming:
+            last_assistant_idx = max(i for i, m in enumerate(convo) if m.get("role") == "assistant")
+            img_msgs = convo[last_assistant_idx + 1:] or convo[-1:]
+        else:
+            img_msgs = convo
+        stdin_data = _to_cli_stream_json_input(img_msgs).encode("utf-8")
+        logger.info(
+            "[claude-cli-session] session_id=%s image turn via stream-json stdin (%d bytes)",
+            session_id, len(stdin_data),
+        )
+        cmd = _build_cmd("", resume=resuming, stream_json_input=True)
+        result = None
+        async for chunk in _run(cmd, stdin_data=stdin_data):
+            if isinstance(chunk, str):
+                yield chunk
+            else:
+                result = chunk
+        returncode, emitted_any, err_text = result if result else (0, False, "")
+
+        # Same --resume-store-gone fallback as the text path: retry once as a
+        # fresh session with the full transcript's images if resume drew a blank.
+        if returncode != 0 and resuming and not emitted_any:
+            stdin_data = _to_cli_stream_json_input(convo).encode("utf-8")
+            cmd = _build_cmd("", resume=False, stream_json_input=True)
+            result = None
+            async for chunk in _run(cmd, stdin_data=stdin_data):
+                if isinstance(chunk, str):
+                    yield chunk
+                else:
+                    result = chunk
+            returncode, emitted_any, err_text = result if result else (0, False, "")
+
+        if returncode != 0:
+            hint = " (run `claude login` inside the container if this is an authentication error)"
+            yield f'event: error\ndata: {json.dumps({"error": f"claude CLI exited {returncode}: {err_text}{hint}", "status": 502})}\n\n'
+            return
+        yield "data: [DONE]\n\n"
+        return
+
+    cmd = _build_cmd(prompt, resume=resuming)
+    result = None
+    async for chunk in _run(cmd):
+        if isinstance(chunk, str):
+            yield chunk
+        else:
+            result = chunk
+    returncode, emitted_any, err_text = result if result else (0, False, "")
+
+    if returncode != 0 and resuming and not emitted_any:
+        # The CLI has no record of this session id (e.g. the container was
+        # recreated and its local session store is gone) — fall back once to
+        # a fresh session under the same id with the full transcript, rather
+        # than failing the turn outright.
+        logger.info(
+            "[claude-cli-session] session_id=%s --resume failed (%s) before any output — "
+            "falling back to full-transcript --session-id",
+            session_id, err_text.splitlines()[0] if err_text else returncode,
+        )
+        fallback_prompt = _flatten_messages_for_claude_cli(convo)
+        cmd = _build_cmd(fallback_prompt, resume=False)
+        result = None
+        async for chunk in _run(cmd):
+            if isinstance(chunk, str):
+                yield chunk
+            else:
+                result = chunk
+        returncode, emitted_any, err_text = result if result else (0, False, "")
+
+    if returncode != 0:
+        hint = " (run `claude login` inside the container if this is an authentication error)"
+        yield f'event: error\ndata: {json.dumps({"error": f"claude CLI exited {returncode}: {err_text}{hint}", "status": 502})}\n\n'
+        return
+
+    yield "data: [DONE]\n\n"
+
+
+async def _stream_with_timeout(agen, timeout: int):
+    """Wrap an async generator so overall iteration respects `timeout` seconds."""
+    loop = asyncio.get_event_loop()
+    start = loop.time()
+    it = agen.__aiter__()
+    while True:
+        remaining = timeout - (loop.time() - start)
+        if remaining <= 0:
+            raise asyncio.TimeoutError(f"claude CLI stream exceeded {timeout}s")
+        try:
+            chunk = await asyncio.wait_for(it.__anext__(), timeout=remaining)
+        except StopAsyncIteration:
+            return
+        yield chunk
+
+
 def _stream_target_url(url: str) -> str:
     provider = _detect_provider(url)
+    if provider == "claude-cli":
+        return url
     if provider == "anthropic":
         return _normalize_anthropic_url(url)
     if provider == "ollama":
@@ -2073,34 +2689,165 @@ def _stream_target_url(url: str) -> str:
     return _normalize_openai_chat_url(url)
 
 
+# ── Usage/cost recording (cost dashboard) ──────────────────────────────────
+
+def _extract_usage_counts(provider: str, data: Dict) -> Tuple[int, int, int, int]:
+    """Pull (input, output, cache_read, cache_write) from a raw response dict."""
+    if provider == "anthropic":
+        u = data.get("usage") or {}
+        return (
+            u.get("input_tokens", 0) or 0,
+            u.get("output_tokens", 0) or 0,
+            u.get("cache_read_input_tokens", 0) or 0,
+            u.get("cache_creation_input_tokens", 0) or 0,
+        )
+    if provider == "ollama":
+        return (data.get("prompt_eval_count", 0) or 0, data.get("eval_count", 0) or 0, 0, 0)
+    u = data.get("usage") or {}
+    ptd = u.get("prompt_tokens_details") or {}
+    return (
+        u.get("prompt_tokens", 0) or 0,
+        u.get("completion_tokens", 0) or 0,
+        ptd.get("cached_tokens", 0) or 0,
+        0,
+    )
+
+
+def _price_for_model(model: str):
+    """(input, output, cache_read) $/million from ModelPricing substring match."""
+    try:
+        from core.database import SessionLocal, ModelPricing
+        db = SessionLocal()
+        try:
+            ml = (model or "").lower()
+            best = None
+            for row in db.query(ModelPricing).all():
+                pat = (row.model or "").lower()
+                if pat and pat in ml and (best is None or len(pat) > len(best[0])):
+                    best = (pat, row)
+            if best:
+                r = best[1]
+                return (r.input_price_per_million, r.output_price_per_million,
+                        r.cache_read_price_per_million)
+        finally:
+            db.close()
+    except Exception:
+        pass
+    return None
+
+
+def _compute_cost_cents(provider, model, inp, out, cread, cwrite):
+    """Estimate cost in cents, or None when no pricing match exists."""
+    p = _price_for_model(model)
+    if not p:
+        return None
+    ip, op, cp = p
+    if ip is None or op is None:
+        return None
+    cache_rate = cp if cp is not None else ip
+    # OpenAI-style prompt_tokens INCLUDES cached tokens; Anthropic (and the
+    # Claude Code CLI, which reports Anthropic-shaped usage) reports input_tokens
+    # that EXCLUDE cached reads. Subtract cached from the fresh-input count only
+    # for the OpenAI style so cached tokens aren't billed at both rates.
+    if provider in ("anthropic", "claude-cli"):
+        fresh_input = inp or 0
+    else:
+        fresh_input = max(0, (inp or 0) - (cread or 0))
+    dollars = (fresh_input * ip + (cread or 0) * cache_rate + (out or 0) * op) / 1_000_000.0
+    return round(dollars * 100.0, 6)
+
+
+def record_usage_event(session_id, role, provider, model, input_tokens, output_tokens,
+                       cache_read_tokens=0, cache_write_tokens=0, owner=None):
+    """Persist one UsageEvent. Fire-and-forget on a daemon thread so the caller
+    (including the streaming hot path) never blocks on a DB write."""
+    if not (input_tokens or output_tokens):
+        return
+    cost = _compute_cost_cents(provider, model, input_tokens, output_tokens,
+                               cache_read_tokens, cache_write_tokens)
+
+    def _write():
+        try:
+            from core.database import SessionLocal, UsageEvent, utcnow_naive
+            db = SessionLocal()
+            try:
+                db.add(UsageEvent(
+                    session_id=session_id, owner=owner, role=role or "default",
+                    provider=provider, model=model,
+                    input_tokens=input_tokens or 0, output_tokens=output_tokens or 0,
+                    cache_read_tokens=cache_read_tokens or 0,
+                    cache_write_tokens=cache_write_tokens or 0,
+                    cost_cents=cost, created_at=utcnow_naive(),
+                ))
+                db.commit()
+            finally:
+                db.close()
+        except Exception as e:
+            logger.debug(f"record_usage_event failed: {e}")
+
+    try:
+        threading.Thread(target=_write, daemon=True).start()
+    except Exception as e:
+        logger.debug(f"record_usage_event dispatch failed: {e}")
+
+
 async def stream_llm(url: str, model: str, messages: List[Dict], temperature: float = LLMConfig.DEFAULT_TEMPERATURE,
                      max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                      timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                      tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
-                     tool_choice_none: bool = False, workload: str = "foreground"):
+                     tool_choice_none: bool = False, workload: str = "foreground",
+                     claude_cli_effort: Optional[str] = None, role: Optional[str] = None,
+                     owner: Optional[str] = None):
     target_url = _stream_target_url(url)
+    provider = _detect_provider(url)
+    _last_usage = {}
     async with _local_model_slot(target_url, model, workload):
-        async for chunk in _stream_llm_inner(
-            url,
-            model,
-            messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            headers=headers,
-            timeout=timeout,
-            prompt_type=prompt_type,
-            tools=tools,
-            session_id=session_id,
-            tool_choice_none=tool_choice_none,
-        ):
-            yield chunk
+        try:
+            async for chunk in _stream_llm_inner(
+                url,
+                model,
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                headers=headers,
+                timeout=timeout,
+                prompt_type=prompt_type,
+                tools=tools,
+                session_id=session_id,
+                tool_choice_none=tool_choice_none,
+                claude_cli_effort=claude_cli_effort,
+            ):
+                # Track the most recent usage payload so we can record ONE
+                # UsageEvent after the stream completes — never a mid-stream DB
+                # write (see the performance note in the cost-dashboard plan).
+                if isinstance(chunk, str) and '"type": "usage"' in chunk:
+                    for line in chunk.splitlines():
+                        if line.startswith("data:"):
+                            try:
+                                _j = json.loads(line[5:].strip())
+                                if _j.get("type") == "usage":
+                                    _last_usage = _j.get("data") or {}
+                            except Exception:
+                                pass
+                yield chunk
+        finally:
+            if _last_usage:
+                record_usage_event(
+                    session_id=session_id, role=role, provider=provider, model=model,
+                    input_tokens=_last_usage.get("input_tokens", 0) or 0,
+                    output_tokens=_last_usage.get("output_tokens", 0) or 0,
+                    cache_read_tokens=(_last_usage.get("cache_read_input_tokens", 0)
+                                       or _last_usage.get("cache_read_tokens", 0) or 0),
+                    cache_write_tokens=_last_usage.get("cache_creation_input_tokens", 0) or 0,
+                    owner=owner,
+                )
 
 
 async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperature: float = LLMConfig.DEFAULT_TEMPERATURE,
                             max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                             timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                             tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
-                            tool_choice_none: bool = False):
+                            tool_choice_none: bool = False, claude_cli_effort: Optional[str] = None):
     """Stream LLM responses with improved error handling.
 
     Yields SSE chunks:
@@ -2110,6 +2857,12 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
       - data: [DONE]                       — end of stream
     """
     provider = _detect_provider(url)
+
+    if provider == "claude-cli":
+        async for chunk in _stream_claude_cli(model, _sanitize_llm_messages(messages), timeout, effort=claude_cli_effort, session_id=session_id):
+            yield chunk
+        return
+
     messages_copy = _sanitize_llm_messages(messages)
 
     # Consolidate multiple system messages into one at the start.

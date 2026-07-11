@@ -702,11 +702,17 @@ async function loadEndpoints() {
                 <a href="#" data-ep-select-none="${epId}">None</a>
               </span>
             </div>${warningHtml}${showSearch ? `<input type="search" class="mcp-tools-search" placeholder="Search ${sortedModels.length} models..." data-ep-search="${epId}">` : ''}<div class="mcp-tools-list">` + sortedModels.map(m =>
-              `<label title="${esc(m.id)}" data-ep-model-row data-search="${esc((m.display + ' ' + m.id).toLowerCase())}" class="adm-model-row">
-                <input type="checkbox" class="adm-cb-hidden" data-ep-model-id="${esc(m.id)}" ${!m.is_hidden ? 'checked' : ''}>
-                <span class="adm-check-dot" aria-hidden="true"></span>
-                <span>${esc(m.display)}</span>
-              </label>`
+              `<div data-ep-model-row data-search="${esc((m.display + ' ' + m.id).toLowerCase())}" class="adm-model-row-wrap">
+                <div style="display:flex;align-items:center;gap:6px;">
+                  <label title="${esc(m.id)}" class="adm-model-row" style="flex:1;min-width:0;">
+                    <input type="checkbox" class="adm-cb-hidden" data-ep-model-id="${esc(m.id)}" ${!m.is_hidden ? 'checked' : ''}>
+                    <span class="adm-check-dot" aria-hidden="true"></span>
+                    <span>${esc(m.display)}</span>
+                  </label>
+                  <button type="button" class="admin-btn-sm adm-ctx-toggle" data-ep-model-ctx-toggle="${esc(m.id)}" title="Set context window (Ollama num_ctx)" style="font-size:10px;padding:1px 6px;white-space:nowrap;">${m.context_override ? esc(String(m.context_override)) + ' ctx' : 'ctx: auto'}</button>
+                </div>
+                <div class="adm-model-options hidden" data-ep-model-options="${esc(m.id)}" style="padding:6px 8px 8px 26px;font-size:11px;"></div>
+              </div>`
             ).join('') + '</div>';
             const filterRows = (q) => {
               const needle = q.trim().toLowerCase();
@@ -732,6 +738,16 @@ async function loadEndpoints() {
             });
             panel.querySelectorAll('input[type=checkbox]').forEach(cb => {
               cb.addEventListener('change', () => _saveEpModelState(epId, panel));
+            });
+            panel.querySelectorAll('[data-ep-model-ctx-toggle]').forEach(btn => {
+              btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                const modelId = btn.dataset.epModelCtxToggle;
+                const opts = panel.querySelector(`[data-ep-model-options="${CSS.escape(modelId)}"]`);
+                if (!opts) return;
+                const nowHidden = opts.classList.toggle('hidden');
+                if (!nowHidden && !opts.dataset.loaded) _loadEpModelContext(epId, modelId, opts, btn);
+              });
             });
           };
           try {
@@ -774,6 +790,57 @@ async function _saveEpModelState(epId, panel) {
       settingsModule.refreshAiModelEndpoints();
     }
   } catch (e) { /* silent */ }
+}
+
+async function _loadEpModelContext(epId, modelId, opts, btn) {
+  opts.dataset.loaded = '1';
+  opts.innerHTML = '<span style="opacity:0.55;">Loading recommendation…</span>';
+  let data = {};
+  try {
+    const res = await fetch(`/api/model-endpoints/${epId}/model-context?model=${encodeURIComponent(modelId)}`, { credentials: 'same-origin' });
+    data = await res.json();
+  } catch (_) { data = {}; }
+  if (data && data.applicable === false) {
+    opts.innerHTML = `<span style="opacity:0.6;">${esc(data.note || 'Context override is not available for this endpoint.')}</span>`;
+    return;
+  }
+  const cur = (data && data.current_override) || '';
+  const rec = data && data.recommended;
+  const max = data && data.model_max;
+  const hint = rec
+    ? `Recommended: <b>${rec}</b>${max ? ` &middot; model max ${max}` : ''}`
+    : (max ? `Model max ${max}` : 'Auto-detected');
+  opts.innerHTML =
+    `<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+       <span>Context window:</span>
+       <input type="number" min="512" ${max ? `max="${max}"` : ''} step="512" placeholder="${rec || 'auto'}" value="${cur}" data-ep-model-ctx-input style="width:92px;">
+       ${rec ? `<a href="#" data-ctx-use-rec>use ${rec}</a>` : ''}
+       <a href="#" data-ctx-reset>reset to auto</a>
+     </div>
+     <div style="opacity:0.6;margin-top:4px;">${hint}. Blank = auto-detect. Sent to Ollama as <code>num_ctx</code> (the KV-cache size).</div>`;
+  const input = opts.querySelector('[data-ep-model-ctx-input]');
+  const commit = () => _saveEpModelContext(epId, modelId, input.value, btn);
+  input.addEventListener('change', commit);
+  opts.querySelector('[data-ctx-use-rec]')?.addEventListener('click', (e) => { e.preventDefault(); input.value = rec; commit(); });
+  opts.querySelector('[data-ctx-reset]')?.addEventListener('click', (e) => { e.preventDefault(); input.value = ''; commit(); });
+}
+
+async function _saveEpModelContext(epId, modelId, rawValue, btn) {
+  const v = parseInt(rawValue, 10);
+  const value = (Number.isFinite(v) && v > 0) ? v : null;
+  try {
+    await fetch(`/api/model-endpoints/${epId}/models`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ context_overrides: { [modelId]: value } }),
+    });
+    if (btn) btn.textContent = value ? `${value} ctx` : 'ctx: auto';
+    if (uiModule?.showToast) {
+      const short = modelId.split('/').pop();
+      uiModule.showToast(value ? `Context for ${short} set to ${value}` : `Context for ${short} reset to auto`, 3500);
+    }
+  } catch (_) { /* silent */ }
 }
 
 function initEndpointForm() {
@@ -836,6 +903,23 @@ function initEndpointForm() {
       if (msg) {
         msg.textContent = '';
         msg.className = '';
+      }
+    } else if (provider.value === 'claude-cli://local') {
+      urlInput.placeholder = 'Claude Code CLI (runs `claude login` in the container)';
+      urlInput.readOnly = true;
+      if (apiKey) {
+        apiKey.value = '';
+        apiKey.placeholder = 'No API key needed — authenticate via `claude login`';
+        apiKey.disabled = true;
+      }
+      if (msg) {
+        msg.textContent = 'Run `docker exec -it <container> claude login` once to authenticate with your Team subscription.';
+        msg.className = '';
+      }
+      if (testBtn) {
+        testBtn.disabled = true;
+        testBtn.style.opacity = '0.45';
+        testBtn.style.cursor = 'not-allowed';
       }
     } else {
       urlInput.placeholder = 'Base URL or pick provider';
@@ -1019,7 +1103,7 @@ function initEndpointForm() {
       const rawUrl = (urlInput.value || provider.value).trim();
       const apiKey = el('adm-epApiKey').value.trim();
       if (!rawUrl) { msg.textContent = 'Select a provider or enter a base URL'; msg.className = 'admin-error'; return; }
-      if (provider.value && !apiKey) { msg.textContent = 'API key is required for cloud providers'; msg.className = 'admin-error'; return; }
+      if (provider.value && provider.value !== 'claude-cli://local' && !apiKey) { msg.textContent = 'API key is required for cloud providers'; msg.className = 'admin-error'; return; }
       const url = provider.value && rawUrl === provider.value ? rawUrl : _normalizeBaseUrl(rawUrl);
       apiTestController = new AbortController();
       apiTestBtn.disabled = true;
@@ -1071,7 +1155,7 @@ function initEndpointForm() {
     const rawUrl = (urlInput.value || provider.value).trim();
     const apiKey = el('adm-epApiKey').value.trim();
     if (!rawUrl) { msg.textContent = 'Select a provider or enter a base URL'; msg.className = 'admin-error'; return; }
-    if (provider.value && !apiKey) { msg.textContent = 'API key is required for cloud providers'; msg.className = 'admin-error'; return; }
+    if (provider.value && provider.value !== 'claude-cli://local' && !apiKey) { msg.textContent = 'API key is required for cloud providers'; msg.className = 'admin-error'; return; }
     // Normalize URL (fix typos, add /v1, strip wrong paths)
     const url = provider.value && rawUrl === provider.value ? rawUrl : _normalizeBaseUrl(rawUrl);
     const btn = el('adm-epAddBtn');
@@ -1994,9 +2078,15 @@ async function loadMcpServers() {
     const servers = await res.json();
     if (!servers.length) { list.innerHTML = '<div class="admin-empty">No MCP servers configured</div>'; return; }
     list.innerHTML = servers.map(s => {
-      const statusColor = s.needs_oauth ? '#e5a33a' : s.status === 'connected' ? 'var(--fg)' : s.status === 'error' ? 'var(--red)' : 'color-mix(in srgb, var(--fg) 50%, transparent)';
+      // `needs_oauth` only covers the legacy manual (Google keys-file) OAuth
+      // config path. Servers using the newer RFC 9728 / Dynamic Client
+      // Registration auto-discovery flow (any `http` transport server with
+      // no `oauth_config` row, e.g. Atlassian) instead report
+      // status === 'needs_auth' + a live `auth_url` — treat both as "needs auth".
+      const needsAnyAuth = s.needs_oauth || s.status === 'needs_auth';
+      const statusColor = needsAnyAuth ? '#e5a33a' : s.status === 'connected' ? 'var(--fg)' : s.status === 'error' ? 'var(--red)' : 'color-mix(in srgb, var(--fg) 50%, transparent)';
       const toolInfo = s.status === 'connected' ? `${s.enabled_tool_count}/${s.tool_count} tools enabled` : '';
-      const statusText = s.needs_oauth ? 'Needs authorization' : s.status === 'connected' ? `Connected (${toolInfo})` : s.status === 'error' ? `Error: ${s.error || 'unknown'}` : 'Disconnected';
+      const statusText = needsAnyAuth ? 'Needs authorization' : s.status === 'connected' ? `Connected (${toolInfo})` : s.status === 'error' ? `Error: ${s.error || 'unknown'}` : 'Disconnected';
       const hasTools = s.status === 'connected' && s.tool_count > 0;
       return `<div class="admin-user-row" data-adm-mcp-id="${s.id}">
         <div style="display:flex;align-items:center;justify-content:space-between;${hasTools ? 'cursor:pointer;' : ''}padding:4px 0;" data-adm-mcp-header="${s.id}">
@@ -2006,7 +2096,7 @@ async function loadMcpServers() {
             ${hasTools ? `<span style="font-size:10px;opacity:0.4;">Click to manage tools</span>` : ''}
           </div>
           <div style="display:flex;gap:4px;align-items:center;">
-            ${s.needs_oauth ? `<a href="/api/mcp/oauth/authorize/${s.id}" target="_blank" class="admin-btn-sm" style="background:var(--red);color:#fff;text-decoration:none;padding:3px 10px;border-radius:4px;font-size:11px;font-weight:600;">Authorize</a>` : ''}
+            ${s.needs_oauth ? `<a href="/api/mcp/oauth/authorize/${s.id}" target="_blank" class="admin-btn-sm" style="background:var(--red);color:#fff;text-decoration:none;padding:3px 10px;border-radius:4px;font-size:11px;font-weight:600;">Authorize</a>` : s.status === 'needs_auth' ? `<button class="admin-btn-sm" data-adm-mcp-authorize="${s.id}" data-adm-mcp-authorize-url="${s.auth_url ? esc(s.auth_url) : ''}" style="background:var(--red);color:#fff;padding:3px 10px;border-radius:4px;font-size:11px;font-weight:600;">Authorize</button>` : ''}
             <button class="admin-btn-sm" data-adm-mcp-reconnect="${s.id}">Reconnect</button>
             <button class="admin-btn-delete" style="border-color:${s.is_enabled ? 'color-mix(in srgb, var(--red) 30%, transparent)' : 'color-mix(in srgb, var(--fg) 30%, transparent)'};color:${s.is_enabled ? 'var(--red)' : 'var(--fg)'};" data-adm-mcp-toggle="${s.id}" data-adm-mcp-enable="${!s.is_enabled}">${s.is_enabled ? 'Disable' : 'Enable'}</button>
             <button class="admin-btn-delete" data-adm-mcp-delete="${s.id}">Delete</button>
@@ -2016,6 +2106,26 @@ async function loadMcpServers() {
         ${hasTools ? `<div class="mcp-tools-panel hidden" data-adm-mcp-tools-panel="${s.id}"></div>` : ''}
       </div>`;
     }).join('');
+    list.querySelectorAll('[data-adm-mcp-authorize]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const url = btn.getAttribute('data-adm-mcp-authorize-url');
+        if (url) { window.open(url, '_blank', 'noopener'); return; }
+        // auth_url can lag behind discovery/DCR completing — poll briefly.
+        const id = btn.getAttribute('data-adm-mcp-authorize');
+        const msg = el('adm-mcpMsg'); if (msg) { msg.textContent = 'Waiting for authorization link...'; msg.className = ''; }
+        let tries = 0;
+        const poll = setInterval(async () => {
+          tries++;
+          try {
+            const r = await fetch('/api/mcp/servers', { credentials: 'same-origin' });
+            const list2 = await r.json();
+            const s2 = list2.find(x => x.id === id);
+            if (s2 && s2.auth_url) { clearInterval(poll); window.open(s2.auth_url, '_blank', 'noopener'); if (msg) msg.textContent = ''; loadMcpServers(); }
+            else if (tries >= 15) { clearInterval(poll); if (msg) msg.textContent = 'Authorization link not available yet — try Reconnect.'; }
+          } catch (e) { clearInterval(poll); }
+        }, 2000);
+      });
+    });
     list.querySelectorAll('[data-adm-mcp-reconnect]').forEach(btn => {
       btn.addEventListener('click', async () => {
         const msg = el('adm-mcpMsg'); msg.textContent = 'Reconnecting...'; msg.className = '';
@@ -3074,7 +3184,7 @@ function initAll() {
   modalEl = el('settings-modal');
   const inits = [
     initSignupToggle, initShareDefaultsToggle, initAddUser, initEndpointForm, initMcpForm,
-    initCalDAV, initBackup, initDangerZone, initTokenForm, initLogsView,
+    initCalDAV, initBackup, initDangerZone, initTokenForm, initLogsView, initUsageView,
     () => settingsModule.initIntegrations()
   ];
   for (const fn of inits) {
@@ -3091,6 +3201,229 @@ function refreshAll() {
   loadMcpServers();
   loadTokens();
   loadLogs(false);
+  loadUsageStats();
+  loadModelPricing();
+}
+
+/* ═══════════════════════════════════════════
+   USAGE & COST
+   ═══════════════════════════════════════════ */
+function _fmtUsd(n) {
+  const v = Number(n || 0);
+  return '$' + (v < 1 ? v.toFixed(4) : v.toFixed(2));
+}
+
+let _usageAutoTimer = null;
+
+// Poll only while the Usage & Cost panel is actually visible, so a background
+// timer never hammers the endpoint when the user is on another tab or has the
+// settings modal closed.
+function _usagePanelVisible() {
+  const panel = document.querySelector('[data-settings-panel="usage"]');
+  if (!panel || panel.classList.contains('hidden')) return false;
+  const modal = document.getElementById('settings-modal');
+  if (modal && modal.classList.contains('hidden')) return false;
+  return true;
+}
+
+function _stopUsageAutoRefresh() {
+  if (_usageAutoTimer) { clearInterval(_usageAutoTimer); _usageAutoTimer = null; }
+  const st = document.getElementById('usage-autorefresh-status');
+  if (st) st.textContent = '';
+}
+
+function _startUsageAutoRefresh() {
+  _stopUsageAutoRefresh();
+  const sel = document.getElementById('usage-autorefresh-interval');
+  const secs = Math.max(5, parseInt(sel && sel.value, 10) || 30);
+  const st = document.getElementById('usage-autorefresh-status');
+  if (st) st.textContent = `on · every ${secs}s`;
+  _usageAutoTimer = setInterval(() => {
+    // Self-heal: if the panel got hidden (tab switch / modal close) without a
+    // toggle event, stop polling rather than fetching invisibly.
+    if (!_usagePanelVisible()) { _stopUsageAutoRefresh(); return; }
+    loadUsageStats();
+  }, secs * 1000);
+}
+
+function initUsageView() {
+  const btn = document.getElementById('usage-refresh-btn');
+  if (btn && !btn._wired) {
+    btn._wired = true;
+    btn.addEventListener('click', () => loadUsageStats());
+  }
+
+  const toggle = document.getElementById('usage-autorefresh-toggle');
+  const sel = document.getElementById('usage-autorefresh-interval');
+  if (toggle && !toggle._wired) {
+    toggle._wired = true;
+    // Restore persisted preference.
+    try {
+      toggle.checked = localStorage.getItem('odysseus_usage_autorefresh') === '1';
+      const savedInt = localStorage.getItem('odysseus_usage_autorefresh_interval');
+      if (savedInt && sel) sel.value = savedInt;
+    } catch (_) {}
+    toggle.addEventListener('change', () => {
+      try { localStorage.setItem('odysseus_usage_autorefresh', toggle.checked ? '1' : '0'); } catch (_) {}
+      if (toggle.checked) { loadUsageStats(); _startUsageAutoRefresh(); }
+      else _stopUsageAutoRefresh();
+    });
+  }
+  if (sel && !sel._wired) {
+    sel._wired = true;
+    sel.addEventListener('change', () => {
+      try { localStorage.setItem('odysseus_usage_autorefresh_interval', sel.value); } catch (_) {}
+      if (toggle && toggle.checked) _startUsageAutoRefresh();  // apply new cadence
+    });
+  }
+
+  // If the user previously left auto-refresh on, resume it when the panel opens.
+  if (toggle && toggle.checked && _usagePanelVisible()) _startUsageAutoRefresh();
+
+  const addBtn = document.getElementById('pricing-add-btn');
+  if (addBtn && !addBtn._wired) {
+    addBtn._wired = true;
+    addBtn.addEventListener('click', async () => {
+      const model = (document.getElementById('pricing-new-model').value || '').trim();
+      if (!model) { _pricingMsg('Enter a model pattern', false); return; }
+      const ok = await _savePricing({
+        model,
+        input_price_per_million: document.getElementById('pricing-new-input').value,
+        output_price_per_million: document.getElementById('pricing-new-output').value,
+        cache_read_price_per_million: document.getElementById('pricing-new-cache').value,
+      });
+      if (ok) {
+        ['pricing-new-model', 'pricing-new-input', 'pricing-new-output', 'pricing-new-cache']
+          .forEach(id => { const e = document.getElementById(id); if (e) e.value = ''; });
+        loadModelPricing();
+      }
+    });
+  }
+}
+
+async function loadUsageStats() {
+  const body = document.getElementById('usage-stats-body');
+  if (!body) return;
+  try {
+    const res = await fetch('/api/auth/usage-stats', { credentials: 'same-origin' });
+    if (res.status === 401 || res.status === 403) { body.innerHTML = '<div class="admin-empty">Access denied</div>'; return; }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const d = await res.json();
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+
+    const t = d.totals_usd || {};
+    const totalsHtml = `
+      <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
+        ${[['Today', t.today], ['This week', t.week], ['This month', t.month], ['All time', t.all_time]].map(([lbl, v]) => `
+          <div style="flex:1;min-width:110px;border:1px solid var(--border);border-radius:8px;padding:8px 10px;">
+            <div style="font-size:11px;opacity:0.6;">${lbl}</div>
+            <div style="font-size:18px;font-weight:600;">${_fmtUsd(v)}</div>
+          </div>`).join('')}
+      </div>`;
+
+    const table = (title, rows, keyLabel) => {
+      if (!rows || !rows.length) return `<div style="margin-bottom:12px;"><div class="admin-toggle-label">${title}</div><div class="admin-empty">No data</div></div>`;
+      return `<div style="margin-bottom:14px;">
+        <div class="admin-toggle-label" style="margin-bottom:4px;">${title}</div>
+        <table style="width:100%;border-collapse:collapse;font-size:12px;">
+          <thead><tr style="text-align:left;opacity:0.6;">
+            <th style="padding:3px 6px;">${keyLabel}</th><th style="padding:3px 6px;">Cost</th>
+            <th style="padding:3px 6px;">Calls</th><th style="padding:3px 6px;">In</th><th style="padding:3px 6px;">Out</th>
+          </tr></thead>
+          <tbody>${rows.map(r => `<tr style="border-top:1px solid var(--border);">
+            <td style="padding:3px 6px;">${esc(r.key ?? r.session_id)}</td>
+            <td style="padding:3px 6px;">${_fmtUsd(r.cost_usd)}</td>
+            <td style="padding:3px 6px;">${r.calls ?? ''}</td>
+            <td style="padding:3px 6px;">${(r.input_tokens ?? '').toLocaleString?.() ?? ''}</td>
+            <td style="padding:3px 6px;">${(r.output_tokens ?? '').toLocaleString?.() ?? ''}</td>
+          </tr>`).join('')}</tbody>
+        </table></div>`;
+    };
+
+    const cache = d.cache || {};
+    const cacheHtml = `<div style="margin-bottom:14px;border:1px solid var(--border);border-radius:8px;padding:8px 10px;">
+      <div class="admin-toggle-label">Cache savings (estimated)</div>
+      <div class="admin-toggle-sub">${(cache.cached_tokens || 0).toLocaleString()} cached input tokens · ~${_fmtUsd(cache.estimated_saved_usd)} saved vs. uncached</div>
+    </div>`;
+
+    body.innerHTML = totalsHtml + cacheHtml
+      + table('By role', d.by_role, 'Role')
+      + table('By model', d.by_model, 'Model')
+      + table('By provider', d.by_provider, 'Provider')
+      + table('By session (top 50)', d.by_session, 'Session');
+  } catch (e) {
+    body.innerHTML = '<div class="admin-error">Failed to load usage stats</div>';
+  }
+}
+
+/* ── Model pricing editor ── */
+function _pricingMsg(text, ok) {
+  const m = document.getElementById('pricing-editor-msg');
+  if (!m) return;
+  m.textContent = text; m.style.color = ok ? 'var(--fg)' : 'var(--red)';
+  if (text) setTimeout(() => { if (m.textContent === text) m.textContent = ''; }, 2500);
+}
+
+async function loadModelPricing() {
+  const body = document.getElementById('pricing-editor-body');
+  if (!body) return;
+  try {
+    const res = await fetch('/api/auth/model-pricing', { credentials: 'same-origin' });
+    if (res.status === 401 || res.status === 403) { body.innerHTML = '<div class="admin-empty">Access denied</div>'; return; }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const d = await res.json();
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const cell = (pat, field, val) => `<input type="number" step="any" min="0" data-pat="${esc(pat)}" data-field="${field}" value="${val == null ? '' : esc(val)}" style="width:78px;padding:2px 4px;font-size:12px;">`;
+    const rows = (d.items || []);
+    if (!rows.length) { body.innerHTML = '<div class="admin-empty">No pricing rows</div>'; return; }
+    body.innerHTML = `<table style="width:100%;border-collapse:collapse;font-size:12px;">
+      <thead><tr style="text-align:left;opacity:0.6;">
+        <th style="padding:3px 6px;">Model pattern</th><th style="padding:3px 6px;">Input $/M</th>
+        <th style="padding:3px 6px;">Output $/M</th><th style="padding:3px 6px;">Cache $/M</th><th></th>
+      </tr></thead>
+      <tbody>${rows.map(r => `<tr style="border-top:1px solid var(--border);">
+        <td style="padding:3px 6px;font-family:monospace;">${esc(r.model)}</td>
+        <td style="padding:3px 6px;">${cell(r.model, 'input_price_per_million', r.input_price_per_million)}</td>
+        <td style="padding:3px 6px;">${cell(r.model, 'output_price_per_million', r.output_price_per_million)}</td>
+        <td style="padding:3px 6px;">${cell(r.model, 'cache_read_price_per_million', r.cache_read_price_per_million)}</td>
+        <td style="padding:3px 6px;"><button class="admin-btn-sm pricing-del-btn" data-pat="${esc(r.model)}" title="Delete this pricing row">✕</button></td>
+      </tr>`).join('')}</tbody></table>`;
+
+    // Inline edits: save the whole row on blur of any field.
+    body.querySelectorAll('input[data-pat]').forEach(inp => {
+      inp.addEventListener('change', async () => {
+        const pat = inp.dataset.pat;
+        const get = (f) => { const e = body.querySelector(`input[data-pat="${CSS.escape(pat)}"][data-field="${f}"]`); return e ? e.value : ''; };
+        await _savePricing({
+          model: pat,
+          input_price_per_million: get('input_price_per_million'),
+          output_price_per_million: get('output_price_per_million'),
+          cache_read_price_per_million: get('cache_read_price_per_million'),
+        });
+      });
+    });
+    body.querySelectorAll('.pricing-del-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        if (!confirm(`Delete pricing for "${btn.dataset.pat}"?`)) return;
+        try {
+          const r = await fetch('/api/auth/model-pricing/' + encodeURIComponent(btn.dataset.pat), { method: 'DELETE', credentials: 'same-origin' });
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          _pricingMsg('Deleted', true); loadModelPricing();
+        } catch (e) { _pricingMsg('Delete failed', false); }
+      });
+    });
+  } catch (e) {
+    body.innerHTML = '<div class="admin-error">Failed to load pricing</div>';
+  }
+}
+
+async function _savePricing(payload) {
+  try {
+    const r = await fetch('/api/auth/model-pricing', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    if (!r.ok) { const t = await r.text(); throw new Error(t || ('HTTP ' + r.status)); }
+    _pricingMsg('Saved', true);
+    return true;
+  } catch (e) { _pricingMsg('Save failed: ' + String(e.message || e).slice(0, 80), false); return false; }
 }
 
 /* ═══════════════════════════════════════════
@@ -3104,10 +3437,19 @@ export function _initData() {
 export function open(tab) {
   _initData();
   settingsModule.open(tab || 'services');
+  // Start/stop the usage auto-refresh timer based on which tab is now showing.
+  const toggle = document.getElementById('usage-autorefresh-toggle');
+  if (tab === 'usage' && toggle && toggle.checked) {
+    loadUsageStats();
+    _startUsageAutoRefresh();
+  } else {
+    _stopUsageAutoRefresh();
+  }
 }
 
 export function close() {
   stopLogsPolling();
+  _stopUsageAutoRefresh();
   settingsModule.close();
 }
 

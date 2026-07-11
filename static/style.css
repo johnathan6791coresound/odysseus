@@ -2374,7 +2374,21 @@ body.bg-pattern-sparkles {
       transition: opacity 0.22s ease, transform 0.22s ease;
       will-change: opacity, transform;
     }
+    .chat-input-top > .claude-effort-wrap {
+      position: absolute;
+      top: 0;
+      /* Sits just left of the model picker (right:0) instead of on top of it. */
+      right: 84px;
+      z-index: 250;
+      transition: opacity 0.22s ease, transform 0.22s ease;
+      will-change: opacity, transform;
+    }
     .chat-input-top > .model-picker-wrap.model-picker-autohide {
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(-4px) scale(0.96);
+    }
+    .chat-input-top > .claude-effort-wrap.claude-effort-autohide {
       opacity: 0;
       pointer-events: none;
       transform: translateY(-4px) scale(0.96);
@@ -3832,12 +3846,12 @@ body.bg-pattern-sparkles {
       font-size:0.8rem;
       color:var(--fg);
       box-shadow:0 8px 24px rgba(0,0,0,0.4);
-      min-width:180px;
+      min-width:240px;
       line-height:1.7;
     }
     .ctx-label {
       display:inline-block;
-      width:60px;
+      width:90px;
       color:var(--color-muted-alt);
       font-size:0.75rem;
     }

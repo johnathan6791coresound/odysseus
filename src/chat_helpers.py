@@ -44,6 +44,12 @@ _VISION_MODEL_KEYWORDS = (
     # hosted
     "gpt-4o", "gpt-4.1", "gpt-4.5", "gpt-4-turbo", "gpt-4-vision",
     "claude-sonnet", "claude-opus", "claude-haiku", "gemini",
+    # Claude Code CLI backend exposes bare tier aliases ("sonnet"/"opus"/
+    # "haiku"/"fable", see CLAUDE_CLI_MODELS) rather than the "claude-*"
+    # snapshot ids above. Every current Claude tier is multimodal, so match
+    # the bare names too — otherwise a CLI chat's image is dropped for a lossy
+    # text caption instead of being handed straight to the model.
+    "sonnet", "opus", "haiku", "fable",
     # open / local
     "vision", "multimodal", "llava", "bakllava", "moondream", "pixtral", "minicpm",
     "internvl", "cogvlm", "qwen-vl", "qwen2-vl", "qwen3-vl", "qwen3vl",

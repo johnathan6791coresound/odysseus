@@ -2633,6 +2633,7 @@ function initializeEventListeners() {
     'overflow-plus-btn':   '.overflow-wrapper',
     'mode-toggle':         '.mode-toggle',
     'preset-mini-btn':     '#overflow-preset-btn',
+    'claude-effort-select': '#claude-effort-wrap',
     'attach-btn':          '#overflow-attach-btn',
     'research-btn':        '#overflow-research-btn',
     'rail-new-chat':       '#rail-new-session',
@@ -4011,6 +4012,10 @@ function startOdysseusApp() {
       const hidePicker = (messageInput.value || '').replace(/\s/g, '').length >= _MODEL_PICKER_HIDE_CHARS;
       if (modelPickerWrap) {
         modelPickerWrap.classList.toggle('model-picker-autohide', hidePicker);
+      }
+      const effortWrap = document.getElementById('claude-effort-wrap');
+      if (effortWrap) {
+        effortWrap.classList.toggle('claude-effort-autohide', hidePicker);
       }
     };
     window._syncModelPickerAutohide = _syncModelPickerAutohide;

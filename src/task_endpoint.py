@@ -75,4 +75,6 @@ async def task_llm_call_async(
         raise RuntimeError("No LLM endpoint available for background task")
     await wait_for_interactive_quiet("background task LLM")
     kwargs.setdefault("workload", "background")
+    kwargs.setdefault("role", "task")
+    kwargs.setdefault("owner", owner)
     return await llm_call_async_with_fallback(candidates, messages=messages, **kwargs)

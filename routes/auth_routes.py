@@ -671,6 +671,239 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
         _save_settings(current)
         return current
 
+    # ---- Usage & cost dashboard (admin only) ----
+
+    @router.get("/usage-stats")
+    async def usage_stats(request: Request):
+        """Aggregated LLM usage/cost for the Usage & Cost admin tab."""
+        user = _get_current_user(request)
+        if not user or not auth_manager.is_admin(user):
+            raise HTTPException(403, "Admin only")
+
+        from datetime import datetime, timezone, timedelta
+        from sqlalchemy import func
+        from core.database import SessionLocal, UsageEvent, ModelPricing
+
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        start_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_week = start_today - timedelta(days=now.weekday())
+        start_month = start_today.replace(day=1)
+
+        db = SessionLocal()
+        try:
+            def _spend_since(dt):
+                q = db.query(func.coalesce(func.sum(UsageEvent.cost_cents), 0.0))
+                if dt is not None:
+                    q = q.filter(UsageEvent.created_at >= dt)
+                return round(float(q.scalar() or 0.0) / 100.0, 4)  # dollars
+
+            totals = {
+                "today": _spend_since(start_today),
+                "week": _spend_since(start_week),
+                "month": _spend_since(start_month),
+                "all_time": _spend_since(None),
+            }
+
+            def _group(col):
+                rows = (
+                    db.query(
+                        col,
+                        func.coalesce(func.sum(UsageEvent.cost_cents), 0.0),
+                        func.coalesce(func.sum(UsageEvent.input_tokens), 0),
+                        func.coalesce(func.sum(UsageEvent.output_tokens), 0),
+                        func.count(UsageEvent.id),
+                    )
+                    .group_by(col)
+                    .all()
+                )
+                out = []
+                for key, cents, inp, out_tok, n in rows:
+                    out.append({
+                        "key": key or "(unknown)",
+                        "cost_usd": round(float(cents or 0.0) / 100.0, 4),
+                        "input_tokens": int(inp or 0),
+                        "output_tokens": int(out_tok or 0),
+                        "calls": int(n or 0),
+                    })
+                out.sort(key=lambda r: r["cost_usd"], reverse=True)
+                return out
+
+            by_role = _group(UsageEvent.role)
+            by_model = _group(UsageEvent.model)
+            by_provider = _group(UsageEvent.provider)
+
+            # Per-session cost (top 50 by spend) for spot-checking.
+            sess_rows = (
+                db.query(
+                    UsageEvent.session_id,
+                    func.coalesce(func.sum(UsageEvent.cost_cents), 0.0),
+                    func.count(UsageEvent.id),
+                )
+                .group_by(UsageEvent.session_id)
+                .all()
+            )
+            by_session = sorted(
+                [
+                    {
+                        "session_id": sid or "(none)",
+                        "cost_usd": round(float(cents or 0.0) / 100.0, 4),
+                        "calls": int(n or 0),
+                    }
+                    for sid, cents, n in sess_rows
+                ],
+                key=lambda r: r["cost_usd"], reverse=True,
+            )[:50]
+
+            # Cache-savings estimate: for each model, cached input tokens billed at
+            # the discounted cache rate instead of the full input rate.
+            pricing = {
+                (p.model or "").lower(): p for p in db.query(ModelPricing).all()
+            }
+
+            def _price_for(model):
+                ml = (model or "").lower()
+                best = None
+                for pat, row in pricing.items():
+                    if pat and pat in ml and (best is None or len(pat) > len(best[0])):
+                        best = (pat, row)
+                return best[1] if best else None
+
+            cache_rows = (
+                db.query(
+                    UsageEvent.model,
+                    func.coalesce(func.sum(UsageEvent.cache_read_tokens), 0),
+                )
+                .group_by(UsageEvent.model)
+                .all()
+            )
+            cache_saved_usd = 0.0
+            cached_tokens_total = 0
+            for model, cread in cache_rows:
+                cread = int(cread or 0)
+                cached_tokens_total += cread
+                p = _price_for(model)
+                if not p or p.input_price_per_million is None:
+                    continue
+                cache_rate = (p.cache_read_price_per_million
+                              if p.cache_read_price_per_million is not None else 0.0)
+                cache_saved_usd += cread * (p.input_price_per_million - cache_rate) / 1_000_000.0
+
+            return {
+                "totals_usd": totals,
+                "by_role": by_role,
+                "by_model": by_model,
+                "by_provider": by_provider,
+                "by_session": by_session,
+                "cache": {
+                    "cached_tokens": cached_tokens_total,
+                    "estimated_saved_usd": round(cache_saved_usd, 4),
+                },
+            }
+        finally:
+            db.close()
+
+    @router.get("/model-pricing")
+    async def list_model_pricing(request: Request):
+        """List all model-pricing rows (admin only)."""
+        user = _get_current_user(request)
+        if not user or not auth_manager.is_admin(user):
+            raise HTTPException(403, "Admin only")
+        from core.database import SessionLocal, ModelPricing
+        db = SessionLocal()
+        try:
+            rows = db.query(ModelPricing).order_by(ModelPricing.model).all()
+            return {"items": [r.to_dict() for r in rows]}
+        finally:
+            db.close()
+
+    @router.post("/model-pricing")
+    async def upsert_model_pricing(request: Request):
+        """Create or update a pricing row (admin only). Keyed by ``model`` pattern.
+
+        Body: {model, input_price_per_million, output_price_per_million,
+        cache_read_price_per_million}. Prices may be null to leave a rate unset;
+        an empty string is treated as null.
+        """
+        user = _get_current_user(request)
+        if not user or not auth_manager.is_admin(user):
+            raise HTTPException(403, "Admin only")
+        body = await request.json()
+        pattern = (body.get("model") or "").strip().lower()
+        if not pattern:
+            raise HTTPException(400, "model pattern is required")
+
+        def _num(v):
+            if v is None or v == "":
+                return None
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                raise HTTPException(400, "prices must be numbers")
+            if f < 0:
+                raise HTTPException(400, "prices must be non-negative")
+            return f
+
+        from core.database import SessionLocal, ModelPricing
+        db = SessionLocal()
+        try:
+            row = db.query(ModelPricing).filter(ModelPricing.model == pattern).first()
+            if not row:
+                row = ModelPricing(model=pattern)
+                db.add(row)
+            row.input_price_per_million = _num(body.get("input_price_per_million"))
+            row.output_price_per_million = _num(body.get("output_price_per_million"))
+            row.cache_read_price_per_million = _num(body.get("cache_read_price_per_million"))
+            db.commit()
+            return row.to_dict()
+        finally:
+            db.close()
+
+    @router.delete("/model-pricing/{pattern}")
+    async def delete_model_pricing(pattern: str, request: Request):
+        """Delete a pricing row by its model pattern (admin only)."""
+        user = _get_current_user(request)
+        if not user or not auth_manager.is_admin(user):
+            raise HTTPException(403, "Admin only")
+        from core.database import SessionLocal, ModelPricing
+        db = SessionLocal()
+        try:
+            row = db.query(ModelPricing).filter(ModelPricing.model == (pattern or "").strip().lower()).first()
+            if row:
+                db.delete(row)
+                db.commit()
+            return {"ok": True}
+        finally:
+            db.close()
+
+    @router.get("/effective-utility-model")
+    async def effective_utility_model(request: Request):
+        """Report which model utility work actually resolves to right now.
+
+        Mirrors the admin_tools 'effective utility model' virtual key so the AI
+        settings panel can show it without the agent chat tool. Resolves for the
+        current user so per-user defaults are reflected.
+        """
+        user = _get_current_user(request)
+        owner = user if user else None
+        configured = (_load_settings().get("utility_model") or "").strip()
+        if configured:
+            return {"descriptor": f"{configured} (configured)", "auto": False}
+        try:
+            from src.endpoint_resolver import resolve_endpoint
+            url, model, _ = resolve_endpoint("utility", owner=owner)
+        except Exception as e:
+            return {"descriptor": f"unknown ({e})", "auto": True}
+        u = url or ""
+        if not model:
+            desc = "none — using default chat model"
+        elif "claude-cli" in u:
+            desc = f"{model} (Claude CLI subscription)"
+        elif any(h in u for h in ("localhost", "127.0.0.1", "host.docker.internal", ":11434", ":1234", ":8080")):
+            desc = f"{model} (local, free)"
+        else:
+            desc = f"{model} (api)"
+        return {"descriptor": f"auto: {desc}", "auto": True}
+
     # ---- Integrations CRUD ----
 
     # Run migration on startup

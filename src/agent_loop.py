@@ -246,6 +246,18 @@ _API_AGENT_RULES = """\
 - User identity facts/preferences ("my name is X", "call me X", "I live in X") use `manage_memory`, not contacts.
 """
 
+# Delegation-to-cheap-model guidance. Injected into the base rules only when
+# cost_auto_routing_enabled is on for the current owner (see _build_base_prompt),
+# and only effective once _resolve_model understands the "utility" role alias.
+_COST_DELEGATION_RULE = (
+    "- For simple, well-scoped sub-tasks (reformatting, drafting boilerplate, "
+    "summarizing a fetched document, a pipeline step that doesn't need deep "
+    "reasoning), prefer delegating to model `utility` via `chat_with_model`, a "
+    "`pipeline` step, or `create_session` instead of doing it yourself, to reduce "
+    "cost — but do it yourself if the task needs your full conversation context "
+    "or judgment."
+)
+
 _LINK_RULES = """\
 ## Link conventions
 When referencing app entities by id, use clickable markdown anchors:
@@ -392,7 +404,8 @@ Fetch and read the text content of a SPECIFIC URL the user names (e.g. "check ex
 ```read_file
 <file path>
 ```
-Read a file and return its contents.""",
+Read a file and return its contents.
+The user's local git repos (host machine, outside this container) are mounted read-write at `/app/host-git`. When a request refers to a project, repo, or file on "my laptop"/"the local machine" without an in-container path, look there first instead of asking where it is.""",
 
     "write_file": """\
 ```write_file
@@ -528,6 +541,7 @@ If the user asks for a reminder/alarm before the event, pass `reminder_minutes` 
     "ui_control": "- ```ui_control``` — Control the UI: toggle tools on/off, OPEN PANELS, open email reply drafts, switch models, change themes. Commands: `toggle <name> on/off` (names: bash/shell, web/search, research, incognito, document_editor/documents), `open_panel <name>` (panels: documents, gallery, email, sessions, notes, memories/brain, skills, settings, cookbook), `open_email_reply <uid> <folder> <reply|reply-all|ai-reply> <body text>` (opens an email compose document pre-filled with body, DOES NOT send; use this for normal “write/draft a reply saying X” requests), `set_mode agent/chat`, `switch_model <name>`, `set_theme <preset>`, `create_theme <name> <bg> <fg> <panel> <border> <accent>` (optional key=val for advanced colors AND background effects: bgPattern=<none|dots|synapse|rain|constellations|perlin-flow|petals|sparkles|embers>, bgEffectColor=#RRGGBB, bgEffectIntensity=<num>, bgEffectSize=<num>, frosted=true|false). \"open documents\" / \"open library\" / \"show gallery\" / \"open inbox\" / \"open notes\" / \"open cookbook\" all map to `open_panel <name>`. Built-in theme presets: dark, light, midnight, paper, cyberpunk, retrowave, forest, ocean, ume, copper, terminal, organs, lavender, gpt, claude, cute. For any other vibe/name, use create_theme.",
     "ask_user": "- ```ask_user``` — Ask the user a multiple-choice question when the task is genuinely ambiguous and the answer changes what you do next (pick an approach, confirm an assumption, choose a target). Args (JSON): {\"question\": \"...\", \"options\": [{\"label\": \"...\", \"description\": \"...\"?}, ...], \"multi\": false?}. 2-6 options. The user gets clickable buttons; calling this ENDS your turn and their choice comes back as your next message. Prefer sensible defaults — only ask when you truly can't proceed well without their input.",
     "update_plan": "- ```update_plan``` — While executing an approved plan, write the plan back: tick steps done or revise them. Args (JSON): {\"plan\": \"- [x] done step\\n- [ ] next step\"}. Always pass the COMPLETE checklist, not a diff. Call it after finishing each step (mark it `- [x]`) and whenever the user asks to change the plan. The user's docked plan window updates live. Does nothing if there's no active plan.",
+    "load_tools": "- ```load_tools``` — Load one or more real tools by exact name from the tool catalog in the system prompt so you can call them for real, this turn and every future message in this session. Args (JSON): {\"names\": [\"send_email\"]}. The catalog lists every tool that exists (name + one-line description), but only ALWAYS-AVAILABLE tools and anything already loaded have a real schema you can call yet — everything else must be loaded first.",
     "list_served_models": "- ```list_served_models``` — Show what the Cookbook (LLM-serving subsystem) is currently running. NO args. Use this for ANY 'what's running' / 'what's serving' / 'show my cookbook' / 'is anything up' query. DO NOT shell out (`ps aux`, `docker ps`, etc.) — this tool is the source of truth. Failed serve tasks include recent logs plus diagnosis/retry suggestions; use those suggestions to call `serve_model` again with an adjusted command when appropriate.",
     "stop_served_model": "- ```stop_served_model``` — Stop a running model server. Args (JSON): {\"session_id\": \"<from list_served_models>\"}. Use for 'kill my cookbook' / 'stop the model' / 'shut down vLLM'.",
     "tail_serve_output": "- ```tail_serve_output``` — Read the actual tmux stderr/traceback of a CURRENTLY failing cookbook task. Args (JSON): {\"session_id\": \"<from list_served_models>\", \"tail\": 150?}. **Use ONLY after** you just launched something via `serve_model` AND `list_served_models` reports YOUR new task as `crashed`/`error`. DO NOT use it on old stopped/completed download tasks (they're historical noise — won't predict whether a new launch succeeds). DO NOT call it before launching a fresh attempt. When you do call it, bump `tail` to 400+ only if the visible error references 'see root cause above'.",
@@ -1616,6 +1630,7 @@ def _build_system_prompt(
     _email_style_message = None
     _integ_message = None
     _mcp_desc_message = None
+    _catalog_message = None
     _active_doc_is_email_doc = False
     if active_document:
         set_active_document(active_document.id)
@@ -2014,6 +2029,26 @@ def _build_system_prompt(
         except Exception as _mcp_err:
             logger.debug(f"MCP description injection skipped: {_mcp_err}")
 
+    # Always-on tool catalog (name + one-line description for every tool
+    # that exists) so the model can see the full menu regardless of what
+    # got RAG/keyword/session-loaded into _relevant_tools this turn — call
+    # `load_tools` on anything here that isn't already callable. Cheap
+    # (trimmed one-liners, not full schemas); MCP portion overlaps with the
+    # richer _mcp_desc_message above, which is fine — this is the compact
+    # index, that's the full detail once you already know the server exists.
+    if not suppress_local_context:
+        try:
+            from src.tool_index import build_tool_catalog
+            _catalog_text = build_tool_catalog(
+                disabled_tools=set(disabled_tools or []),
+                mcp_mgr=mcp_mgr,
+                mcp_disabled_map=mcp_disabled_map,
+            )
+            if _catalog_text:
+                _catalog_message = untrusted_context_message("tool catalog", _catalog_text)
+        except Exception as _cat_err:
+            logger.debug(f"Tool catalog injection skipped: {_cat_err}")
+
     agent_msg = {"role": "system", "content": agent_prompt}
     insert_idx = 0
     for i, msg in enumerate(messages):
@@ -2061,6 +2096,9 @@ def _build_system_prompt(
         last_user_idx += 1
     if _mcp_desc_message:
         merged.insert(last_user_idx, _mcp_desc_message)
+        last_user_idx += 1
+    if _catalog_message:
+        merged.insert(last_user_idx, _catalog_message)
         last_user_idx += 1
     if _skills_message:
         merged.insert(last_user_idx, _skills_message)
@@ -2126,6 +2164,18 @@ def _build_base_prompt(
             )
         elif compact:
             agent_prompt = _assemble_prompt(set(TOOL_SECTIONS.keys()), disabled, compact=True)
+
+    # Cost auto-routing: nudge the agent to delegate cheap, well-scoped
+    # sub-tasks to the `utility` role. Gated on the same master toggle as the
+    # endpoint-resolver routing (item 3), checked per-owner at assembly time so
+    # turning the feature off removes any reason to reach for "utility".
+    try:
+        from src.settings import get_user_setting
+        if get_user_setting("cost_auto_routing_enabled", owner or "",
+                            get_setting("cost_auto_routing_enabled", True)):
+            agent_prompt = agent_prompt + "\n" + _COST_DELEGATION_RULE
+    except Exception as _e:
+        logger.debug(f"Cost-delegation rule injection skipped: {_e}")
 
     # Inject the Level-0 skill index — one line per skill so the agent
     # knows what canonical procedures exist. Includes published skills
@@ -2321,6 +2371,9 @@ def _compute_final_metrics(
     prep_timings: Optional[Dict[str, float]] = None,
     backend_gen_tps: float = 0,
     backend_prefill_tps: float = 0,
+    cache_read_tokens: int = 0,
+    cache_creation_tokens: int = 0,
+    total_cost_usd: float = 0,
 ) -> dict:
     """Compute token counts, TPS, and build the final metrics dict."""
     if has_real_usage:
@@ -2363,6 +2416,14 @@ def _compute_final_metrics(
     }
     if backend_prefill_tps and backend_prefill_tps > 0:
         metrics["prefill_tps"] = round(backend_prefill_tps, 2)
+    # Prompt-cache effectiveness (Anthropic API / claude-cli). cache_read>0
+    # is the concrete proof a continuing session's prior context was served
+    # from cache rather than repriced fresh -- surface it on the card.
+    if cache_read_tokens or cache_creation_tokens:
+        metrics["cache_read_input_tokens"] = cache_read_tokens
+        metrics["cache_creation_input_tokens"] = cache_creation_tokens
+    if total_cost_usd:
+        metrics["total_cost_usd"] = round(total_cost_usd, 6)
     if prep_timings:
         prep_total = round(sum(prep_timings.values()), 3)
         metrics["agent_prep_time"] = prep_total
@@ -2564,6 +2625,7 @@ async def stream_agent_loop(
     uploaded_files: Optional[List[Dict]] = None,
     workload: str = "foreground",
     _is_teacher_run: bool = False,
+    claude_cli_effort: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
     """Streaming agent loop generator.
 
@@ -2620,16 +2682,33 @@ async def stream_agent_loop(
             "mcp__email__list_emails", "mcp__email__read_email",
         })
     _prompt_active_document = active_document if _active_document_relevant else None
+    # The claude-cli backend has no native tool-schema channel — it only gets
+    # tool access via the fenced-block catalog baked into the system prompt
+    # (see llm_core._stream_claude_cli). The low-signal fast path below skips
+    # building that system prompt entirely (bare user message, tools=None),
+    # which left claude-cli sessions with zero tools for the whole session.
+    # Never take the fast path for this backend so the real system prompt
+    # (with its tool catalog) always gets built.
+    _is_claude_cli_endpoint = (endpoint_url or "").strip().lower().startswith("claude-cli://")
     _direct_low_signal = (
         _low_signal_turn
+        # `low_signal` only means "matched no domain keyword" (see
+        # _classify_agent_request) — that includes real first-turn questions
+        # phrased without any of the hardcoded trigger words, not just
+        # greetings. Require the stricter greeting/slang detector too, so a
+        # genuine question never gets routed to this tools=None fast path
+        # just because it didn't happen to contain "file"/"email"/"search"/etc.
+        and _casual_low_signal_turn
         and not _existing_conversation
         and not bool(_intent.get("continuation"))
         and not plan_mode
         and not approved_plan
         and not guide_only
-        and (_casual_low_signal_turn or not _active_document_relevant)
-        and (_casual_low_signal_turn or not active_email)
-        and (_casual_low_signal_turn or not workspace)
+        and not _is_claude_cli_endpoint
+        # These three were previously `(_casual_low_signal_turn or not X)`,
+        # relaxed by casual-ness. _casual_low_signal_turn is now a hard
+        # requirement above, so that relaxation always holds — dropped as
+        # dead weight rather than left as always-true noise.
         and not forced_tools
         and not relevant_tools
     )
@@ -2677,6 +2756,7 @@ async def stream_agent_loop(
                 timeout=int(get_setting("agent_stream_timeout_seconds", 300) or 300),
                 session_id=session_id,
                 workload=workload,
+                claude_cli_effort=claude_cli_effort,
             ):
                 if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                     try:
@@ -2743,89 +2823,42 @@ async def stream_agent_loop(
         disabled_tools.update(_mcp_block_q)
     prep_timings["request_setup"] = time.time() - _t0
 
-    # RAG-based tool selection: retrieve relevant tools for this query.
+    # Tool selection: catalog + on-demand load, not per-message RAG guessing.
     # If caller provided a pre-computed set (e.g. task_scheduler), use that.
+    # Otherwise seed from ALWAYS_AVAILABLE plus whatever this session has
+    # already loaded via `load_tools` (persisted on the Session row) — the
+    # full menu of everything else is always visible to the model via the
+    # tool-catalog block injected in _build_system_prompt, and it calls
+    # `load_tools` to pull a real schema into scope the moment it needs one
+    # (see the block.tool_type == "load_tools" handling further down this
+    # function, which unions the result into _relevant_tools for the rest
+    # of this turn and persists it for future turns). This replaces the
+    # embedding-RAG + keyword-fallback selection that used to run here,
+    # which recalculated a narrow, message-dependent subset every turn.
     _relevant_tools = relevant_tools
     _t1 = time.time()
     if _relevant_tools:
         logger.info(f"[tool-rag] Using caller-provided relevant_tools ({len(_relevant_tools)} tools)")
-    if not guide_only and not _relevant_tools and _low_signal_turn:
+    if not guide_only and not _relevant_tools:
         from src.tool_index import ALWAYS_AVAILABLE
+        _relevant_tools = set(ALWAYS_AVAILABLE)
         if workspace:
             # An active workspace IS the file-work signal: a vague "look at the
-            # project" means explore this folder. Surface only the READ-ONLY file
-            # tools (intersection with the plan-mode read-only allowlist) so the
-            # agent can investigate; write/shell tools stay out until the request
-            # actually calls for them (RAG retrieval adds those on a real ask).
-            _relevant_tools = set(ALWAYS_AVAILABLE)
+            # project" means explore this folder. Surface the READ-ONLY file
+            # tools up front so the agent can investigate without needing to
+            # call load_tools first; write/shell tools still require it.
             from src.tool_security import PLAN_MODE_READONLY_TOOLS
             _relevant_tools |= (_DOMAIN_TOOL_MAP["files"] & PLAN_MODE_READONLY_TOOLS)
-            logger.info("[tool-rag] Low-signal but workspace active; including read-only file tools")
-        else:
-            # Don't short-circuit: fall through to RAG retrieval below.
-            # Non-English queries are flagged low_signal by the English-only
-            # intent classifier, but fastembed retrieval works across languages.
-            logger.info("[tool-rag] Low-signal query; will run RAG retrieval")
-    if not guide_only and not _relevant_tools:
-        try:
-            from src.tool_index import get_tool_index, ALWAYS_AVAILABLE
+        if session_id:
             try:
-                tool_idx = await asyncio.wait_for(
-                    asyncio.to_thread(get_tool_index),
-                    timeout=_TOOL_SELECTION_TIMEOUT_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "[tool-rag] Tool index init exceeded %.1fs; falling back to always-available tools",
-                    _TOOL_SELECTION_TIMEOUT_SECONDS,
-                )
-                tool_idx = None
-                _relevant_tools = set(ALWAYS_AVAILABLE)
-            if tool_idx:
-                if mcp_mgr:
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.to_thread(tool_idx.index_mcp_tools, mcp_mgr, _mcp_disabled_map),
-                            timeout=_TOOL_SELECTION_TIMEOUT_SECONDS,
-                        )
-                    except asyncio.TimeoutError:
-                        logger.warning(
-                            "[tool-rag] MCP tool indexing exceeded %.1fs; continuing without reindex",
-                            _TOOL_SELECTION_TIMEOUT_SECONDS,
-                        )
-                if _retrieval_query:
-                    try:
-                        _relevant_tools = await asyncio.wait_for(
-                            asyncio.to_thread(tool_idx.get_tools_for_query, _retrieval_query, 8),
-                            timeout=_TOOL_SELECTION_TIMEOUT_SECONDS,
-                        )
-                        logger.info(f"[tool-rag] Retrieved tools for query: {sorted(_relevant_tools - ALWAYS_AVAILABLE)}")
-                    except asyncio.TimeoutError:
-                        # Leave _relevant_tools unset so the keyword fallback
-                        # below still runs. Hard-coding ALWAYS_AVAILABLE here
-                        # skipped the deterministic keyword hints whenever the
-                        # embedding backend was slow (e.g. a remote endpoint
-                        # cold-loading its model), silently stripping email/
-                        # calendar tools from queries that named them outright.
-                        logger.warning(
-                            "[tool-rag] Retrieval exceeded %.1fs; falling back to keyword tool selection",
-                            _TOOL_SELECTION_TIMEOUT_SECONDS,
-                        )
-                        _relevant_tools = None
-        except Exception as e:
-            logger.warning(f"[tool-rag] Retrieval failed, using keyword fallback: {e}")
-            _relevant_tools = None
-
-    # Fallback: if RAG unavailable, use keyword-based tool selection
-    # instead of sending ALL tools (which overwhelms the model).
-    if not guide_only and not _relevant_tools and _retrieval_query:
-        from src.tool_index import ALWAYS_AVAILABLE, ToolIndex
-        _relevant_tools = set(ALWAYS_AVAILABLE)
-        ql = _retrieval_query.lower()
-        for keywords, tools in ToolIndex._KEYWORD_HINTS.items():
-            if any(kw in ql for kw in keywords):
-                _relevant_tools.update(tools)
-        logger.info(f"[tool-rag] Keyword fallback selected: {sorted(_relevant_tools - ALWAYS_AVAILABLE)}")
+                from core.models import get_session_manager_instance
+                _sm_mgr = get_session_manager_instance()
+                _sess = _sm_mgr.sessions.get(session_id) if _sm_mgr else None
+                if _sess and _sess.loaded_tools:
+                    _relevant_tools |= set(_sess.loaded_tools)
+            except Exception as _lt_err:
+                logger.debug(f"[tool-rag] session loaded_tools lookup skipped: {_lt_err}")
+        logger.info(f"[tool-rag] Seeded from ALWAYS_AVAILABLE + session.loaded_tools: {sorted(_relevant_tools)}")
 
     # If deterministic domain detection fired, seed the corresponding domain
     # tools into the selected tool set. This is not direct prompt-pack
@@ -2857,6 +2890,19 @@ async def stream_agent_loop(
                 )
         if "ui" in (_intent.get("domains") or set()):
             _relevant_tools.add("ui_control")
+
+    # The Claude Code CLI backend has no native tool-calling channel and no
+    # persistent memory of "what it can do" across turns the way Claude Code
+    # itself would — it depends entirely on Odysseus's fenced-block tools.
+    # RAG-narrowing per message-wording (fine for chat models) leaves it
+    # missing read_file/edit_file/bash on ordinary engineering requests,
+    # where it then correctly reports it can't safely edit a file it can't
+    # read — technically honest, but not the intended outcome for what is
+    # effectively a coding-agent backend. Always include the "files" domain
+    # bundle for this provider so it always has real file/shell access,
+    # same as it would running as Claude Code natively.
+    if _relevant_tools is not None and (endpoint_url or "").strip().lower().startswith("claude-cli://"):
+        _relevant_tools.update(_DOMAIN_TOOL_MAP.get("files", set()))
 
     # If this turn targets the open document, keep editing tools available
     # regardless of which selection path (RAG, keyword, caller-provided) ran.
@@ -3060,7 +3106,14 @@ async def stream_agent_loop(
     # the fenced-block path is used instead of native function calling.
     _is_ollama_native = _is_ollama_native_url(endpoint_url or "")
     _ollama_openai_compat = _is_ollama_openai_compat_url(endpoint_url or "")
-    if _endpoint_supports is True:
+    # The Claude Code CLI backend (claude-cli://...) has no native tool-schema
+    # channel — it's driven as a plain text/fenced-block completion backend
+    # regardless of any per-endpoint supports_tools override. See
+    # src/llm_core.py's "claude-cli" provider branch.
+    _is_claude_cli = _is_claude_cli_endpoint
+    if _is_claude_cli:
+        _is_api_model = False
+    elif _endpoint_supports is True:
         _is_api_model = True
     elif (
         _endpoint_supports is False
@@ -3224,6 +3277,9 @@ async def stream_agent_loop(
     has_real_usage = False
     backend_gen_tps = 0      # backend-reported true gen speed (llama.cpp timings)
     backend_prefill_tps = 0  # backend-reported prefill speed
+    cache_read_tokens = 0    # prompt-cache read tokens (last round with real usage)
+    cache_creation_tokens = 0  # prompt-cache write tokens (last round with real usage)
+    total_cost_usd = 0.0     # real per-turn cost, when the provider reports one
     requested_model = model
     actual_model = model
     total_tool_calls = 0  # for budget enforcement
@@ -3376,6 +3432,9 @@ async def stream_agent_loop(
             timeout=agent_stream_timeout,
             session_id=session_id,
             workload=workload,
+            claude_cli_effort=claude_cli_effort,
+            role="default",
+            owner=owner,
         ):
             if not _round_first_event_logged:
                 _round_first_event_logged = True
@@ -3465,6 +3524,16 @@ async def stream_agent_loop(
                             backend_gen_tps = u["gen_tps"]
                         if u.get("prefill_tps"):
                             backend_prefill_tps = u["prefill_tps"]
+                        # Prompt-cache effectiveness (Anthropic API / claude-cli).
+                        # Keep the latest round's values -- for a resumed
+                        # claude-cli session these grow turn over turn, which is
+                        # itself the signal that continuity/caching is working.
+                        if "cache_read_input_tokens" in u:
+                            cache_read_tokens = u.get("cache_read_input_tokens", 0) or 0
+                        if "cache_creation_input_tokens" in u:
+                            cache_creation_tokens = u.get("cache_creation_input_tokens", 0) or 0
+                        if u.get("total_cost_usd"):
+                            total_cost_usd = u["total_cost_usd"]
                     elif data.get("type") == "fallback":
                         # The selected model failed and another answered; surface
                         # the notice so a misconfigured provider isn't masked.
@@ -4065,6 +4134,26 @@ async def stream_agent_loop(
                     except Exception as _e:
                         logger.debug(f"skill requires_toolsets unlock skipped: {_e}")
 
+            # `load_tools` is the on-demand-load half of the tool catalog
+            # (see src/tool_index.py:build_tool_catalog): the model named a
+            # real tool from the always-injected catalog, so give it a real
+            # schema for the REST of this turn (union into _relevant_tools,
+            # same mechanism the manage_skills unlock above uses) and persist
+            # it on the session so future messages don't need to re-load it.
+            if block.tool_type == "load_tools" and not result.get("error"):
+                _lt_names = [n for n in (result.get("loaded") or []) if n not in disabled_tools]
+                if _lt_names:
+                    if _relevant_tools is not None:
+                        _relevant_tools.update(_lt_names)
+                    try:
+                        from core.models import get_session_manager_instance
+                        _sm_mgr = get_session_manager_instance()
+                        if _sm_mgr is not None and session_id:
+                            _sm_mgr.add_loaded_tools(session_id, _lt_names)
+                    except Exception as _e:
+                        logger.debug(f"load_tools session persist skipped: {_e}")
+                    logger.info("[tool-rag] load_tools unlocked for this + future turns: %s", sorted(_lt_names))
+
             # Extract structured web sources from web_search tool output.
             # web_search returns {"output": ..., "exit_code": 0}; check "output"
             # first so the <!-- SOURCES:…--> marker is found and stripped even
@@ -4450,6 +4539,9 @@ async def stream_agent_loop(
         prep_timings=prep_timings,
         backend_gen_tps=backend_gen_tps,
         backend_prefill_tps=backend_prefill_tps,
+        cache_read_tokens=cache_read_tokens,
+        cache_creation_tokens=cache_creation_tokens,
+        total_cost_usd=total_cost_usd,
     )
     metrics["requested_model"] = requested_model
     yield f"data: {json.dumps({'type': 'metrics', 'data': metrics})}\n\n"

@@ -1827,7 +1827,13 @@ export function displayMetrics(messageElement, metrics) {
   const isReal = metrics.usage_source === 'real';
   const ctxPct = metrics.context_percent;
   const model = metrics.model || 'Unknown';
-  const cost = _billableCost(model, inputTokens, outputTokens);
+  // Prefer the provider's own reported cost (claude-cli / Anthropic API) over
+  // the client-side pricing-table estimate when one was actually returned.
+  const realCostUsd = metrics.total_cost_usd;
+  const hasRealCost = realCostUsd != null && realCostUsd > 0;
+  const cost = hasRealCost ? realCostUsd : _billableCost(model, inputTokens, outputTokens);
+  const cacheReadTokens = metrics.cache_read_input_tokens || 0;
+  const cacheCreationTokens = metrics.cache_creation_input_tokens || 0;
 
   // Nothing useful to show — bail out (only if ALL metrics are missing)
   if (!responseTime && !inputTokens && !outputTokens && tps == null && !ctxPct) return;
@@ -1869,7 +1875,14 @@ export function displayMetrics(messageElement, metrics) {
     document.querySelectorAll('.ctx-popup').forEach(p => { if (typeof p._dismiss === 'function') p._dismiss(); else p.remove(); });
 
     const costStr = cost !== null ? `$${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3)}` : '';
-    const costRows = costStr ? `<div><span class="ctx-label">Cost</span> ${costStr}</div>` : '';
+    const costRows = costStr ? `<div><span class="ctx-label">Cost</span> ${costStr}${hasRealCost ? '' : '~'}</div>` : '';
+    // Prompt-cache effectiveness -- cache_read>0 is the concrete proof a
+    // resumed/continuing session's prior context was served from cache
+    // rather than repriced fresh this turn.
+    const cacheRows = (cacheReadTokens || cacheCreationTokens)
+      ? `<div><span class="ctx-label">Cache read</span> ${cacheReadTokens.toLocaleString()} tokens</div>
+         <div><span class="ctx-label">Cache write</span> ${cacheCreationTokens.toLocaleString()} tokens</div>`
+      : '';
     const speedStr = tps != null && tps !== 'undefined' ? `${tps} tok/s` : 'n/a';
     const totalTok = inputTokens + outputTokens;
     const ctxColor = ctxPct >= 85 ? 'var(--red, #e06c75)' : ctxPct >= 70 ? '#ff9900' : 'var(--color-muted-alt, #6b7280)';
@@ -1900,6 +1913,7 @@ export function displayMetrics(messageElement, metrics) {
       ${prepTime != null ? `<div><span class="ctx-label">Prep</span> ${prepTime}s</div>` : ''}
       ${modelWaitTime != null ? `<div><span class="ctx-label">Model wait</span> ${modelWaitTime}s</div>` : ''}
       ${costRows}
+      ${cacheRows}
       ${sessionCostStr}
       ${prepDetails ? `<div style="margin-top:6px;padding-top:6px;border-top:1px solid var(--border);font-size:0.85em;opacity:0.8;">
         <div style="font-weight:600;margin-bottom:4px;color:var(--fg);">Agent prep</div>
